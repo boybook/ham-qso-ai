@@ -24,17 +24,32 @@ const EMPTY_FEATURES: TurnFeatures = {
 export class LLMFeatureExtractor implements IFeatureExtractor {
   private readonly llm: ILLMProvider;
   private readonly logger: ILogger;
+  private readonly maxHistoryTurns: number;
+  private readonly history: Array<{ text: string; turnId?: string }> = [];
 
-  constructor(llm: ILLMProvider, logger?: ILogger) {
+  /**
+   * @param llm LLM provider
+   * @param options.maxHistoryTurns Sliding window size — how many recent turns
+   *        to include as context (default 5). More context = better extraction
+   *        but higher token cost.
+   */
+  constructor(llm: ILLMProvider, options?: { logger?: ILogger; maxHistoryTurns?: number }) {
     this.llm = llm;
-    this.logger = createLogger('LLMFeatureExtractor', logger);
+    this.logger = createLogger('LLMFeatureExtractor', options?.logger);
+    this.maxHistoryTurns = options?.maxHistoryTurns ?? 5;
   }
 
   async extract(text: string, turnId?: string, context?: ExtractionContext): Promise<TurnFeatures> {
     if (!text.trim()) return { ...EMPTY_FEATURES };
 
+    // Add to sliding window
+    this.history.push({ text, turnId });
+    while (this.history.length > this.maxHistoryTurns) {
+      this.history.shift();
+    }
+
     try {
-      const prompt = buildPrompt(text, context);
+      const prompt = buildPrompt(text, context, this.history);
       const result = await this.llm.complete(prompt, {
         jsonMode: true,
         temperature: 0,
@@ -43,6 +58,7 @@ export class LLMFeatureExtractor implements IFeatureExtractor {
       });
 
       if (!result?.text) return { ...EMPTY_FEATURES };
+      this.logger.debug('LLM response', result.text);
       return parseAndValidate(result.text, turnId, this.logger);
     } catch (err) {
       this.logger.warn('LLM extraction failed', {
@@ -71,10 +87,34 @@ Fields (all optional, omit if not found):
 - start: true if CQ/calling detected.
 - v=value, c=confidence(0-1).`;
 
-function buildPrompt(text: string, context?: ExtractionContext): string {
-  let prompt = `"${text}"`;
-  if (context?.myCallsign) prompt += `\nMy call: ${context.myCallsign}`;
-  if (context?.knownCallsigns?.length) prompt += `\nKnown: ${context.knownCallsigns.join(' ')}`;
+function buildPrompt(
+  text: string,
+  context?: ExtractionContext,
+  history?: Array<{ text: string; turnId?: string }>,
+): string {
+  let prompt = '';
+
+  // Include recent history as context (sliding window)
+  if (history && history.length > 1) {
+    prompt += 'Recent conversation:\n';
+    for (let i = 0; i < history.length - 1; i++) {
+      // Truncate old turns to save tokens
+      const truncated = history[i].text.length > 100
+        ? history[i].text.substring(0, 100) + '...'
+        : history[i].text;
+      prompt += `[${i + 1}] ${truncated}\n`;
+    }
+    prompt += '\nCurrent turn to extract from:\n';
+  }
+
+  prompt += `"${text}"`;
+
+  if (context?.myCallsign && context.myCallsign !== 'LISTENER') {
+    prompt += `\nMy call: ${context.myCallsign}`;
+  }
+  if (context?.knownCallsigns?.length) {
+    prompt += `\nKnown: ${context.knownCallsigns.join(' ')}`;
+  }
   return prompt;
 }
 

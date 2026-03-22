@@ -46,16 +46,10 @@
   },
   "dependencies": {
     "eventemitter3": "^5.0.1",
+    "openai": "^4.86.2",
+    "tsx": "^4.21.0",
     "uuid": "^11.1.0",
     "xstate": "^5.19.4"
-  },
-  "peerDependencies": {
-    "openai": ">=4.0.0"
-  },
-  "peerDependenciesMeta": {
-    "openai": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

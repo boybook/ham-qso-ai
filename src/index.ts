@@ -67,6 +67,7 @@ export { ClosingDetector } from './extraction/ClosingDetector.js';
 
 // Segmentation (IVAD implementations)
 export { EnergyVAD } from './segmentation/EnergyVAD.js';
+export { SyllabicVAD } from './segmentation/SyllabicVAD.js';
 
 // Resolver
 export { VotingFieldResolver } from './resolver/FieldCandidateResolver.js';
