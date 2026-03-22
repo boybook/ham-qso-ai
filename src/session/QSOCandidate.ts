@@ -1,9 +1,9 @@
 import { v4 as uuidv4 } from 'uuid';
 import type { QSOCandidateStatus, QSOCandidateInfo } from '../types/candidate.js';
-import type { QSOFields } from '../types/qso.js';
+import type { QSOFields, ResolvedField } from '../types/qso.js';
 import type { ProcessedTurn } from '../types/turn.js';
 import type { TraceEntry } from '../types/trace.js';
-import { VotingFieldResolver } from '../resolver/FieldCandidateResolver.js';
+import { VotingFieldResolver, type ResolvedStationData } from '../resolver/FieldCandidateResolver.js';
 
 /**
  * A QSO candidate represents a potential radio contact being tracked.
@@ -185,7 +185,31 @@ export class QSOCandidate {
 
   getLastActivityAt(): number { return this._lastActivityAt; }
 
+  /** Resolve QSO-level fields (frequency, mode, time, myCallsign). */
   resolveFields(): QSOFields { return this.resolver.resolve(); }
+
+  /** Resolve station-specific data (callsign, RST, name, QTH, grid). */
+  resolveStationData(): ResolvedStationData { return this.resolver.resolveStationData(); }
+
+  /** Get the best resolved callsign for the other station. */
+  getTheirCallsign(): ResolvedField<string> {
+    return this.resolver.resolveStationData().theirCallsign;
+  }
+
+  /** Get all callsign candidates above threshold. */
+  getCallsignCandidates(): ResolvedStationData['callsignCandidates'] {
+    return this.resolver.resolveStationData().callsignCandidates;
+  }
+
+  /** Get RST sent to the other station. */
+  getRstSent(): ResolvedField<string> {
+    return this.resolver.resolveStationData().rstSent;
+  }
+
+  /** Get RST received from the other station. */
+  getRstReceived(): ResolvedField<string> {
+    return this.resolver.resolveStationData().rstReceived;
+  }
 
   isReady(minConfidence?: number): boolean { return this.resolver.isReady(minConfidence); }
 
@@ -207,9 +231,9 @@ export class QSOCandidate {
     if (this._hasTxTurns) score += 0.1;
 
     // Has RST exchange
-    const fields = this.resolver.resolve();
-    if (fields.rstSent.confidence > 0.5) score += 0.05;
-    if (fields.rstReceived.confidence > 0.5) score += 0.05;
+    const stationData = this.resolver.resolveStationData();
+    if (stationData.rstSent.confidence > 0.5) score += 0.05;
+    if (stationData.rstReceived.confidence > 0.5) score += 0.05;
 
     return Math.min(1, score);
   }

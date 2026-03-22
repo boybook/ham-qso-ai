@@ -335,7 +335,7 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
       this.emit('qso:closed', draft);
       this.logger.info('QSO session closed', {
         draftId: draft.id, status: draft.status,
-        callsign: draft.fields.theirCallsign.value,
+        callsign: draft.stations[0]?.callsign,
       });
     }
 
@@ -376,7 +376,7 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
       if (previousStatus === 'draft' && draft.status === 'ready') {
         this.emit('qso:ready', draft);
         this.logger.info('QSO draft ready', {
-          draftId: draft.id, callsign: draft.fields.theirCallsign.value,
+          draftId: draft.id, callsign: draft.stations[0]?.callsign,
         });
       }
     }

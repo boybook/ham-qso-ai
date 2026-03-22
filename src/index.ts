@@ -74,7 +74,7 @@ export { EnergyVAD } from './segmentation/EnergyVAD.js';
 export { SyllabicVAD } from './segmentation/SyllabicVAD.js';
 
 // Resolver
-export { VotingFieldResolver } from './resolver/FieldCandidateResolver.js';
+export { VotingFieldResolver, type ResolvedStationData } from './resolver/FieldCandidateResolver.js';
 export { CandidatePool } from './resolver/CandidatePool.js';
 export { ConfidenceScorer } from './resolver/ConfidenceScorer.js';
 

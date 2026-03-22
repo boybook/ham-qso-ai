@@ -3,6 +3,27 @@ import type { ProcessedTurn } from '../types/turn.js';
 import { CandidatePool } from './CandidatePool.js';
 
 /**
+ * Station-specific data resolved from candidate pools.
+ * Used by the pipeline to feed into StationRegistry / QSODraft.stations[].
+ */
+export interface ResolvedStationData {
+  /** Best callsign candidate for the other station */
+  theirCallsign: ResolvedField<string>;
+  /** All callsign candidates above threshold (for multi-station scenarios) */
+  callsignCandidates: Array<{ value: string; confidence: number; source: string }>;
+  /** RST sent to the other station */
+  rstSent: ResolvedField<string>;
+  /** RST received from the other station */
+  rstReceived: ResolvedField<string>;
+  /** Other station's operator name */
+  theirName?: ResolvedField<string>;
+  /** Other station's QTH */
+  theirQTH?: ResolvedField<string>;
+  /** Other station's grid locator */
+  theirGrid?: ResolvedField<string>;
+}
+
+/**
  * Field resolver interface.
  * All field resolution implementations must conform to this interface.
  */
@@ -11,8 +32,10 @@ export interface IFieldResolver {
   processTurn(turn: ProcessedTurn): void;
   /** Update radio metadata. */
   updateMetadata(frequency: number, mode: string): void;
-  /** Resolve all fields to their best values. */
+  /** Resolve QSO-level fields (frequency, mode, time, myCallsign). */
   resolve(): QSOFields;
+  /** Resolve station-specific data (callsign, RST, name, QTH, grid). */
+  resolveStationData(): ResolvedStationData;
   /** Check if all required fields are resolved with sufficient confidence. */
   isReady(minConfidence?: number): boolean;
   /** Clear all state. */
@@ -82,31 +105,7 @@ export class VotingFieldResolver implements IFieldResolver {
   }
 
   resolve(): QSOFields {
-    const callsignResolved = this.theirCallsign.resolve();
-
-    // In monitor mode, collect all distinct station callsigns (not just the best one)
-    let stationCallsigns: QSOFields['stationCallsigns'];
-    if (callsignResolved?.candidates && callsignResolved.candidates.length > 1) {
-      stationCallsigns = callsignResolved.candidates
-        .filter(c => c.confidence > 0.3)
-        .map(c => ({
-          value: c.value as string,
-          confidence: c.confidence,
-          source: c.source,
-        }));
-    }
-
     return {
-      theirCallsign: callsignResolved ?? {
-        value: '', confidence: 0, source: 'rule',
-      },
-      stationCallsigns,
-      rstSent: this.rstSent.resolve() ?? {
-        value: '59', confidence: 0.3, source: 'rule',
-      },
-      rstReceived: this.rstReceived.resolve() ?? {
-        value: '59', confidence: 0.3, source: 'rule',
-      },
       frequency: {
         value: this.frequency,
         confidence: this.frequency > 0 ? 1.0 : 0,
@@ -127,9 +126,6 @@ export class VotingFieldResolver implements IFieldResolver {
         confidence: 1.0,
         source: 'metadata',
       } : undefined,
-      theirName: this.theirName.resolve() ?? undefined,
-      theirQTH: this.theirQTH.resolve() ?? undefined,
-      theirGrid: this.theirGrid.resolve() ?? undefined,
       myCallsign: {
         value: this.myCallsign,
         confidence: 1.0,
@@ -138,12 +134,49 @@ export class VotingFieldResolver implements IFieldResolver {
     };
   }
 
+  resolveStationData(): ResolvedStationData {
+    const callsignResolved = this.theirCallsign.resolve();
+
+    // Collect all callsign candidates above threshold for multi-station scenarios
+    const callsignCandidates: ResolvedStationData['callsignCandidates'] = [];
+    if (callsignResolved?.candidates) {
+      for (const c of callsignResolved.candidates) {
+        if (c.confidence > 0.3) {
+          callsignCandidates.push({
+            value: c.value as string,
+            confidence: c.confidence,
+            source: c.source,
+          });
+        }
+      }
+    }
+
+    return {
+      theirCallsign: callsignResolved ?? {
+        value: '', confidence: 0, source: 'rule',
+      },
+      callsignCandidates,
+      rstSent: this.rstSent.resolve() ?? {
+        value: '59', confidence: 0.3, source: 'rule',
+      },
+      rstReceived: this.rstReceived.resolve() ?? {
+        value: '59', confidence: 0.3, source: 'rule',
+      },
+      theirName: this.theirName.resolve() ?? undefined,
+      theirQTH: this.theirQTH.resolve() ?? undefined,
+      theirGrid: this.theirGrid.resolve() ?? undefined,
+    };
+  }
+
   isReady(minConfidence: number = 0.6): boolean {
-    const fields = this.resolve();
+    // Check if any callsign candidate meets the confidence threshold
+    const callsignResolved = this.theirCallsign.resolve();
+    const hasCallsign = callsignResolved !== null && callsignResolved.confidence >= minConfidence;
+
     return (
-      fields.theirCallsign.confidence >= minConfidence &&
-      fields.frequency.confidence > 0 &&
-      fields.mode.confidence > 0
+      hasCallsign &&
+      this.frequency > 0 &&
+      this.mode !== ''
     );
   }
 

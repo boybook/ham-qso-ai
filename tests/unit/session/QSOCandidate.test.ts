@@ -160,10 +160,15 @@ describe('QSOCandidate', () => {
       },
     }));
 
+    // QSO-level fields
     const fields = c.resolveFields();
-    expect(fields.theirCallsign.value).toBe('W1AW');
     expect(fields.frequency.value).toBe(14200000);
     expect(fields.myCallsign.value).toBe('BV2XMT');
+
+    // Station-specific data via new API
+    const stationData = c.resolveStationData();
+    expect(stationData.theirCallsign.value).toBe('W1AW');
+    expect(stationData.rstSent.value).toBe('59');
   });
 
   it('should return info snapshot', () => {

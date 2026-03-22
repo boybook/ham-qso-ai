@@ -55,21 +55,12 @@ export interface QSOParticipant {
 }
 
 /**
- * All fields of a QSO log entry.
+ * QSO-level fields (shared across participants).
+ *
+ * Station-specific fields (QTH, name, grid, equipment) live in
+ * QSOParticipant, not here. RST is directional and lives in QSODraft.
  */
 export interface QSOFields {
-  /** Their callsign (highest confidence) */
-  theirCallsign: ResolvedField<string>;
-  /**
-   * All station callsigns detected in this QSO, sorted by confidence.
-   * In monitor/SWL mode (myCallsign = LISTENER), this contains BOTH
-   * participants of the monitored QSO.
-   */
-  stationCallsigns?: ResolvedField<string>[];
-  /** RST sent */
-  rstSent: ResolvedField<string>;
-  /** RST received */
-  rstReceived: ResolvedField<string>;
   /** Frequency in Hz */
   frequency: ResolvedField<number>;
   /** Operating mode */
@@ -78,12 +69,6 @@ export interface QSOFields {
   startTime: ResolvedField<number>;
   /** QSO end time (ms timestamp) */
   endTime?: ResolvedField<number>;
-  /** Their operator name */
-  theirName?: ResolvedField<string>;
-  /** Their QTH / location */
-  theirQTH?: ResolvedField<string>;
-  /** Their grid locator */
-  theirGrid?: ResolvedField<string>;
   /** My callsign */
   myCallsign: ResolvedField<string>;
 }

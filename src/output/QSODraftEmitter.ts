@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { QSODraft, QSODraftStatus, QSOFields, QSOParticipant } from '../types/qso.js';
+import type { QSODraft, QSOFields, QSOParticipant } from '../types/qso.js';
 import type { ProcessedTurn } from '../types/turn.js';
 import type { TraceEntry } from '../types/trace.js';
 
@@ -54,7 +54,7 @@ export class QSODraftEmitter {
     draft.updatedAt = Date.now();
 
     // Auto-promote to ready if key fields resolved
-    if (draft.status === 'draft' && this.isReady(fields)) {
+    if (draft.status === 'draft' && this.isReady(draft)) {
       draft.status = 'ready';
     }
 
@@ -118,14 +118,18 @@ export class QSODraftEmitter {
   }
 
   /**
-   * Check if fields meet "ready" criteria.
+   * Check if a draft meets "ready" criteria.
+   * Requires at least one station participant with confidence >= 0.6,
+   * plus valid frequency and mode.
    */
-  private isReady(fields: QSOFields): boolean {
+  private isReady(draft: QSODraft): boolean {
+    const hasConfidentStation = draft.stations.some(
+      s => s.callsign !== '' && s.confidence >= 0.6,
+    );
     return (
-      fields.theirCallsign.confidence >= 0.6 &&
-      fields.theirCallsign.value !== '' &&
-      fields.frequency.value > 0 &&
-      fields.mode.value !== ''
+      hasConfidentStation &&
+      draft.fields.frequency.value > 0 &&
+      draft.fields.mode.value !== ''
     );
   }
 }

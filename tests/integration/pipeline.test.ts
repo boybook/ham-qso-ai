@@ -121,9 +121,10 @@ describe('QSOPipeline Integration', () => {
     if (updateEvents.length > 0) {
       const latestDraft = updateEvents[updateEvents.length - 1].draft!;
 
-      // Should have detected W1AW as their callsign
-      if (latestDraft.fields.theirCallsign.value) {
-        expect(latestDraft.fields.theirCallsign.value).toBe('W1AW');
+      // Should have detected W1AW as their callsign in stations[]
+      const w1awStation = latestDraft.stations.find(s => s.callsign === 'W1AW');
+      if (latestDraft.stations.length > 0) {
+        expect(w1awStation).toBeDefined();
       }
 
       // Should have frequency from metadata
@@ -144,12 +145,13 @@ describe('QSOPipeline Integration', () => {
     if (updateEvents.length > 0) {
       const latestDraft = updateEvents[updateEvents.length - 1].draft!;
 
-      // Should have detected at least one of the callsigns
-      const callsign = latestDraft.fields.theirCallsign.value;
-      if (callsign) {
-        expect(
-          MONITORED_QSO.expected.callsigns.includes(callsign)
-        ).toBe(true);
+      // Should have detected at least one of the callsigns in stations[]
+      if (latestDraft.stations.length > 0) {
+        const stationCallsigns = latestDraft.stations.map(s => s.callsign);
+        const hasExpected = stationCallsigns.some(
+          cs => MONITORED_QSO.expected.callsigns.includes(cs)
+        );
+        expect(hasExpected).toBe(true);
       }
     }
   });

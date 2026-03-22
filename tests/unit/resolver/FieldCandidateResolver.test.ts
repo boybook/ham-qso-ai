@@ -44,9 +44,9 @@ describe('FieldCandidateResolver', () => {
       },
     }));
 
-    const fields = resolver.resolve();
-    expect(fields.theirCallsign.value).toBe('W1AW');
-    expect(fields.theirCallsign.confidence).toBeGreaterThan(0);
+    const stationData = resolver.resolveStationData();
+    expect(stationData.theirCallsign.value).toBe('W1AW');
+    expect(stationData.theirCallsign.confidence).toBeGreaterThan(0);
   });
 
   it('should not put myCallsign into theirCallsign pool', () => {
@@ -61,8 +61,8 @@ describe('FieldCandidateResolver', () => {
       },
     }));
 
-    const fields = resolver.resolve();
-    expect(fields.theirCallsign.value).not.toBe('BV2XMT');
+    const stationData = resolver.resolveStationData();
+    expect(stationData.theirCallsign.value).not.toBe('BV2XMT');
   });
 
   it('should assign RST to sent pool for TX turns', () => {
@@ -78,8 +78,8 @@ describe('FieldCandidateResolver', () => {
       },
     }));
 
-    const fields = resolver.resolve();
-    expect(fields.rstSent.value).toBe('59');
+    const stationData = resolver.resolveStationData();
+    expect(stationData.rstSent.value).toBe('59');
   });
 
   it('should assign RST to received pool for RX turns in participate mode', () => {
@@ -99,8 +99,8 @@ describe('FieldCandidateResolver', () => {
       },
     }));
 
-    const fields = resolver.resolve();
-    expect(fields.rstReceived.value).toBe('57');
+    const stationData = resolver.resolveStationData();
+    expect(stationData.rstReceived.value).toBe('57');
   });
 
   it('should resolve metadata fields from updateMetadata', () => {
@@ -145,9 +145,9 @@ describe('FieldCandidateResolver', () => {
 
   it('should default RST to 59 with low confidence when not detected', () => {
     const resolver = new FieldCandidateResolver('BV2XMT');
-    const fields = resolver.resolve();
-    expect(fields.rstSent.value).toBe('59');
-    expect(fields.rstSent.confidence).toBeLessThan(0.5);
+    const stationData = resolver.resolveStationData();
+    expect(stationData.rstSent.value).toBe('59');
+    expect(stationData.rstSent.confidence).toBeLessThan(0.5);
   });
 
   it('should clear properly', () => {
@@ -162,7 +162,7 @@ describe('FieldCandidateResolver', () => {
     }));
 
     resolver.clear();
-    const fields = resolver.resolve();
-    expect(fields.theirCallsign.value).toBe('');
+    const stationData = resolver.resolveStationData();
+    expect(stationData.theirCallsign.value).toBe('');
   });
 });
