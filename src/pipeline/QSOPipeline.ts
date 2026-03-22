@@ -1,7 +1,7 @@
 import EventEmitter from 'eventemitter3';
 import type { AudioChunk, RadioMetadata } from '../types/audio.js';
 import type { QSOPipelineConfig } from '../types/config.js';
-import type { QSODraft } from '../types/qso.js';
+import type { QSODraft, QSOParticipant } from '../types/qso.js';
 import type { ProcessedTurn, Turn } from '../types/turn.js';
 import type { ITurnProcessor } from '../types/providers.js';
 import { createLogger, type ILogger } from '../utils/logger.js';
@@ -13,6 +13,7 @@ import { ASRManager } from '../asr/ASRManager.js';
 import { QSOSessionEngine } from '../session/QSOSessionEngine.js';
 import { getFrequencyChangeThreshold } from '../session/QSOStateMachine.js';
 import { QSODraftEmitter } from '../output/QSODraftEmitter.js';
+import { StationRegistry } from '../station/StationRegistry.js';
 
 /**
  * Events emitted by the QSO pipeline.
@@ -44,6 +45,7 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
   private readonly processor: ITurnProcessor;
   private readonly sessionEngine: QSOSessionEngine;
   private readonly draftEmitter: QSODraftEmitter;
+  readonly stationRegistry: StationRegistry;
   private readonly candidateDraftMap: Map<string, string> = new Map();
   private lastFrequency: number = 0;
   private lastMode: string = '';
@@ -93,6 +95,7 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     });
 
     this.draftEmitter = new QSODraftEmitter();
+    this.stationRegistry = new StationRegistry(config.logger);
     this.ingestion = new AudioIngestionManager(vad);
 
     // Wire layers — enqueue turns for sequential async processing
@@ -108,16 +111,16 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     // Wire late-arriving LLM features (for ChainedConversationProcessor)
     if (this.processor instanceof ChainedConversationProcessor) {
       this.processor.onLateFeatures = (_text, features) => {
-        // Feed LLM-discovered callsigns into session engine
-        // This may trigger state transitions (seeking→locked, etc.)
+        // Feed into station registry + session engine
+        this.stationRegistry.feedLateFeatures(features);
         if (features.callsignCandidates.length > 0) {
           this.processor.updateContext({
             knownCallsigns: features.callsignCandidates.map(c => c.value),
           });
-          // Re-process features through session engine as a synthetic turn update
           this.sessionEngine.processLateFeatures(features);
         }
         this.updatePrimaryDraft();
+        this.syncStationsToActiveDrafts();
       };
     }
 
@@ -258,12 +261,53 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
         speakerConfidence: turn.direction === 'tx' ? 1.0 : undefined,
       };
 
+      // Feed turn info into station registry
+      this.stationRegistry.feedTurn(processedTurn);
+
       this.sessionEngine.processTurn(processedTurn);
       this.emit('turn:transcribed', processedTurn);
       this.updatePrimaryDraft();
+      this.syncStationsToActiveDrafts();
     } catch (err) {
       this.logger.error('turn processing failed', err);
       this.emit('error', err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  // ─── Station → Draft sync ───────────────────────────────────
+
+  /**
+   * Sync station context info to all active drafts.
+   * Reads from StationRegistry and populates QSODraft.stations[].
+   */
+  private syncStationsToActiveDrafts(): void {
+    for (const draft of this.draftEmitter.getActive()) {
+      // Build participant list from all stations known to this draft's candidate
+      const candidateId = [...this.candidateDraftMap.entries()]
+        .find(([, dId]) => dId === draft.id)?.[0];
+      if (!candidateId) continue;
+
+      const candidate = this.sessionEngine.getCandidate(candidateId);
+      if (!candidate) continue;
+
+      const participants: QSOParticipant[] = [];
+      for (const cs of candidate.callsigns) {
+        const station = this.stationRegistry.get(cs);
+        if (station) {
+          participants.push({
+            callsign: station.callsign,
+            confidence: station.confidence,
+            qth: station.resolveQTH()?.value,
+            name: station.resolveName()?.value,
+            grid: station.resolveGrid()?.value,
+            equipment: station.resolveEquipment()?.value,
+          });
+        }
+      }
+
+      if (participants.length > 0) {
+        this.draftEmitter.updateStations(draft.id, participants);
+      }
     }
   }
 

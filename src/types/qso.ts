@@ -1,5 +1,6 @@
 import type { ProcessedTurn } from './turn.js';
 import type { TraceEntry } from './trace.js';
+import type { StationSnapshot } from '../station/StationContext.js';
 
 /**
  * Status of a QSO draft.
@@ -14,8 +15,17 @@ export interface QSODraft {
   id: string;
   /** Current status */
   status: QSODraftStatus;
-  /** Resolved fields */
+  /** Resolved fields (legacy format, still populated for backward compatibility) */
   fields: QSOFields;
+  /**
+   * Station-centric participants of this QSO.
+   * Each station carries its own QTH, name, grid, equipment.
+   */
+  stations: QSOParticipant[];
+  /** Direction-specific RST: stationA → stationB */
+  rstAtoB: ResolvedField<string>;
+  /** Direction-specific RST: stationB → stationA */
+  rstBtoA: ResolvedField<string>;
   /** All turns associated with this QSO */
   turns: ProcessedTurn[];
   /** Decision trace for auditing */
@@ -24,6 +34,24 @@ export interface QSODraft {
   createdAt: number;
   /** Last update timestamp */
   updatedAt: number;
+}
+
+/**
+ * A station participating in a QSO, with its resolved context.
+ */
+export interface QSOParticipant {
+  /** Station callsign */
+  callsign: string;
+  /** Callsign confidence */
+  confidence: number;
+  /** Station's QTH */
+  qth?: string;
+  /** Station's operator name */
+  name?: string;
+  /** Station's grid locator */
+  grid?: string;
+  /** Station's equipment description */
+  equipment?: string;
 }
 
 /**

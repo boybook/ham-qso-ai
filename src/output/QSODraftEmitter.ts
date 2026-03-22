@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { QSODraft, QSODraftStatus, QSOFields } from '../types/qso.js';
+import type { QSODraft, QSODraftStatus, QSOFields, QSOParticipant } from '../types/qso.js';
 import type { ProcessedTurn } from '../types/turn.js';
 import type { TraceEntry } from '../types/trace.js';
 
@@ -12,12 +12,21 @@ export class QSODraftEmitter {
   /**
    * Create a new draft.
    */
-  create(fields: QSOFields, turns: ProcessedTurn[], trace: TraceEntry[]): QSODraft {
+  create(
+    fields: QSOFields,
+    turns: ProcessedTurn[],
+    trace: TraceEntry[],
+    stations?: QSOParticipant[],
+  ): QSODraft {
     const now = Date.now();
+    const defaultRst = { value: '59', confidence: 0.3, source: 'rule' as const };
     const draft: QSODraft = {
       id: uuidv4(),
       status: 'draft',
       fields,
+      stations: stations ?? [],
+      rstAtoB: { ...defaultRst },
+      rstBtoA: { ...defaultRst },
       turns: [...turns],
       trace: [...trace],
       createdAt: now,
@@ -61,6 +70,23 @@ export class QSODraftEmitter {
     draft.status = 'final';
     draft.updatedAt = Date.now();
     return draft;
+  }
+
+  /**
+   * Update station participants and direction-specific RSTs on a draft.
+   */
+  updateStations(
+    draftId: string,
+    stations: QSOParticipant[],
+    rstAtoB?: { value: string; confidence: number; source: 'rule' | 'llm' | 'metadata' },
+    rstBtoA?: { value: string; confidence: number; source: 'rule' | 'llm' | 'metadata' },
+  ): void {
+    const draft = this.drafts.get(draftId);
+    if (!draft) return;
+    draft.stations = stations;
+    if (rstAtoB) draft.rstAtoB = rstAtoB;
+    if (rstBtoA) draft.rstBtoA = rstBtoA;
+    draft.updatedAt = Date.now();
   }
 
   /**

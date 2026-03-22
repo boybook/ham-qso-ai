@@ -201,6 +201,17 @@ async function main() {
   console.log('='.repeat(60));
   console.log(`Total turns: ${turns.length}`);
 
+  // Print known stations
+  const stations = pipeline.stationRegistry.getAll();
+  if (stations.length > 0) {
+    console.log(`\nKnown stations: ${stations.length}`);
+    for (const s of stations) {
+      const qth = s.resolveQTH()?.value ?? '?';
+      const equip = s.resolveEquipment()?.value;
+      console.log(`  ${s.callsign} (conf: ${s.confidence.toFixed(2)}, seen ${s.turnCount}x) QTH: ${qth}${equip ? `, Equipment: ${equip}` : ''}`);
+    }
+  }
+
   const drafts = pipeline.getActiveDrafts();
   if (drafts.length > 0) {
     for (const draft of drafts) {
@@ -216,19 +227,25 @@ async function main() {
 function printDraft(draft: QSODraft, label: string) {
   const f = draft.fields;
   console.log(`\n--- ${label} Draft [${draft.status}] ---`);
-  if (f.stationCallsigns && f.stationCallsigns.length > 1) {
-    console.log(`  Stations:       ${f.stationCallsigns.map(c => `${c.value}(${c.confidence.toFixed(2)})`).join(' ↔ ')}`);
+
+  // Station-centric view
+  if (draft.stations.length > 0) {
+    console.log('  Participants:');
+    for (const p of draft.stations) {
+      const parts = [`    ${p.callsign} (conf: ${p.confidence.toFixed(2)})`];
+      if (p.qth) parts.push(`QTH: ${p.qth}`);
+      if (p.equipment) parts.push(`Equipment: ${p.equipment}`);
+      console.log(parts.join(' | '));
+    }
   }
+
+  // Legacy fields
   console.log(`  Their Callsign: ${f.theirCallsign.value || '?'} (conf: ${f.theirCallsign.confidence.toFixed(2)})`);
   console.log(`  RST Sent:       ${f.rstSent.value} (conf: ${f.rstSent.confidence.toFixed(2)})`);
   console.log(`  RST Received:   ${f.rstReceived.value} (conf: ${f.rstReceived.confidence.toFixed(2)})`);
   console.log(`  Frequency:      ${f.frequency.value ? (f.frequency.value / 1000000).toFixed(3) + ' MHz' : '?'}`);
   console.log(`  Mode:           ${f.mode.value || '?'}`);
-  console.log(`  My Callsign:    ${f.myCallsign.value}`);
-  if (f.theirQTH?.value) console.log(`  Their QTH:      ${f.theirQTH.value}`);
-  if (f.theirGrid?.value) console.log(`  Their Grid:     ${f.theirGrid.value}`);
   console.log(`  Turns:          ${draft.turns.length}`);
-  console.log(`  Trace entries:  ${draft.trace.length}`);
 }
 
 main().catch(err => {

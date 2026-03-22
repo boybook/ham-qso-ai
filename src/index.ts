@@ -14,6 +14,7 @@ export type {
 export type {
   QSODraft,
   QSODraftStatus,
+  QSOParticipant,
   ResolvedField,
   FieldCandidate,
 } from './types/qso.js';
@@ -105,6 +106,12 @@ export { QSOPipeline } from './pipeline/QSOPipeline.js';
 export type { QSOPipelineEvents } from './pipeline/QSOPipeline.js';
 export { createPipeline } from './pipeline/createPipeline.js';
 export type { PresetOptions } from './pipeline/createPipeline.js';
+
+// Station
+export { StationContext } from './station/StationContext.js';
+export type { StationSnapshot } from './station/StationContext.js';
+export { StationRegistry } from './station/StationRegistry.js';
+export type { StationRegistrySnapshot } from './station/StationRegistry.js';
 
 // Output
 export { QSODraftEmitter } from './output/QSODraftEmitter.js';
