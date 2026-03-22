@@ -123,11 +123,17 @@ describe('QSOSessionEngine', () => {
     expect(engine.getState()).toBe('locked');
   });
 
-  it('should emit sessionStarted when transitioning to seeking', () => {
+  it('should emit sessionStarted when transitioning to locked (not seeking)', () => {
     const startedSpy = vi.fn();
     engine.on('sessionStarted', startedSpy);
 
-    const turn = makeTurn({
+    // First turn: seeking state — no sessionStarted yet
+    const txTurn = makeTurn({ direction: 'tx' });
+    engine.processTurn(txTurn);
+    expect(startedSpy).not.toHaveBeenCalled();
+
+    // Second turn with callsign: locked state — sessionStarted emitted
+    const rxTurn = makeTurn({
       features: {
         ...makeTurn().features,
         callsignCandidates: [{
@@ -136,8 +142,8 @@ describe('QSOSessionEngine', () => {
         }],
       },
     });
-
-    engine.processTurn(turn);
+    engine.processTurn(rxTurn);
+    expect(engine.getState()).toBe('locked');
     expect(startedSpy).toHaveBeenCalledOnce();
     expect(engine.getCurrentQsoId()).toBeTruthy();
   });
@@ -266,7 +272,7 @@ describe('QSOSessionEngine', () => {
     expect(engine.getCurrentQsoId()).toBeNull();
   });
 
-  it('should track shadow sessions for third-party callsigns in locked state', () => {
+  it('should create a new candidate for third-party callsign in locked state', () => {
     // Get to locked
     const txTurn = makeTurn({ direction: 'tx' });
     engine.processTurn(txTurn);
@@ -283,7 +289,7 @@ describe('QSOSessionEngine', () => {
     engine.processTurn(rxTurn);
     expect(engine.getState()).toBe('locked');
 
-    // Third party callsign
+    // Third party callsign → creates a new candidate and triggers interruption
     const thirdPartyTurn = makeTurn({
       features: {
         ...makeTurn().features,
@@ -295,7 +301,12 @@ describe('QSOSessionEngine', () => {
     });
     engine.processTurn(thirdPartyTurn);
 
-    const shadows = engine.getShadowSessions();
-    expect(shadows.some(s => s.callsign === 'JA1ABC')).toBe(true);
+    // Should have multiple candidates
+    const candidates = engine.getCandidates();
+    expect(candidates.length).toBeGreaterThanOrEqual(2);
+    expect(candidates.some(c => c.callsigns.includes('JA1ABC'))).toBe(true);
+
+    // Should have triggered interruption
+    expect(engine.getState()).toBe('interrupted');
   });
 });

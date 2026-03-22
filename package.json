@@ -39,7 +39,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/foxyrion/ham-qso-ai.git"
+    "url": "https://github.com/boybook/ham-qso-ai.git"
   },
   "engines": {
     "node": ">=18.0.0"

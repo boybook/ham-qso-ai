@@ -34,6 +34,10 @@ export interface ProcessedTurn extends Turn {
   features: TurnFeatures;
   /** Inferred speaker callsign (known for TX, inferred for RX) */
   speaker?: string;
+  /** Speaker inference confidence (1.0 for TX, lower for RX inference) */
+  speakerConfidence?: number;
+  /** Whether this turn appears to be an interruption by a third party */
+  isInterruption?: boolean;
 }
 
 /**

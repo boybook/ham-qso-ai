@@ -35,10 +35,14 @@ export type {
   TraceEntry,
 } from './types/trace.js';
 
+export type {
+  QSOCandidateStatus,
+  QSOCandidateInfo,
+} from './types/candidate.js';
+
 // Interfaces (pluggable stage contracts)
 export type { IFeatureExtractor, ExtractionContext } from './extraction/FeatureExtractor.js';
 export type { IVAD, VADConfig } from './segmentation/types.js';
-export type { IFieldResolver } from './resolver/FieldCandidateResolver.js';
 export type { QSOState } from './session/QSOStateMachine.js';
 
 // Utils
@@ -64,7 +68,7 @@ export { ClosingDetector } from './extraction/ClosingDetector.js';
 // Segmentation (IVAD implementations)
 export { EnergyVAD } from './segmentation/EnergyVAD.js';
 
-// Resolver (IFieldResolver implementations)
+// Resolver
 export { VotingFieldResolver } from './resolver/FieldCandidateResolver.js';
 export { CandidatePool } from './resolver/CandidatePool.js';
 export { ConfidenceScorer } from './resolver/ConfidenceScorer.js';
@@ -82,7 +86,9 @@ export { OpenAICompatibleProvider } from './llm/providers/OpenAICompatibleProvid
 
 // Session
 export { QSOSessionEngine } from './session/QSOSessionEngine.js';
-export { ShadowSessionManager } from './session/ShadowSession.js';
+export { QSOCandidate } from './session/QSOCandidate.js';
+export { QSOCandidateManager } from './session/QSOCandidateManager.js';
+export { getFrequencyChangeThreshold } from './session/QSOStateMachine.js';
 
 // Pipeline
 export { QSOPipeline } from './pipeline/QSOPipeline.js';

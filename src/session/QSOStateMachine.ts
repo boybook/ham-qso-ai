@@ -1,10 +1,24 @@
-import { setup, createActor, type AnyActorRef } from 'xstate';
+import { setup, createActor } from 'xstate';
 import type { ProcessedTurn } from '../types/turn.js';
 
 /**
  * QSO session states.
+ *
+ * State diagram:
+ * ```
+ * idle → seeking → locked ⇌ hold → closed
+ *                    ↕
+ *               interrupted → resuming → locked
+ * ```
  */
-export type QSOState = 'idle' | 'seeking' | 'locked' | 'hold' | 'closed';
+export type QSOState =
+  | 'idle'
+  | 'seeking'
+  | 'locked'
+  | 'hold'
+  | 'interrupted'
+  | 'resuming'
+  | 'closed';
 
 /**
  * Events that drive the QSO state machine.
@@ -18,6 +32,10 @@ export type QSOEvent =
   | { type: 'HOLD_TIMEOUT' }
   | { type: 'FREQUENCY_CHANGED'; newFrequency: number }
   | { type: 'ACTIVITY_RESUMED' }
+  | { type: 'INTERRUPTION_DETECTED'; interrupterCallsign: string }
+  | { type: 'INTERRUPTION_ENDED' }
+  | { type: 'PTT_CHANGED'; active: boolean }
+  | { type: 'MODE_CHANGED'; newMode: string }
   | { type: 'RESET' };
 
 /**
@@ -38,6 +56,10 @@ export interface QSOMachineContext {
   turnCount: number;
   /** Current frequency */
   frequency: number;
+  /** Callsigns snapshot before interruption (for resuming) */
+  interruptedCallsigns: Array<{ callsign: string; direction: 'rx' | 'tx'; confidence: number }>;
+  /** Callsign of the interrupter */
+  interrupterCallsign: string;
 }
 
 const initialContext: QSOMachineContext = {
@@ -48,6 +70,8 @@ const initialContext: QSOMachineContext = {
   closingScore: 0,
   turnCount: 0,
   frequency: 0,
+  interruptedCallsigns: [],
+  interrupterCallsign: '',
 };
 
 /**
@@ -78,6 +102,8 @@ export const qsoStateMachine = setup({
             context.closingScore = 0;
             context.turnCount = 0;
             context.dualCallsignsConfirmed = false;
+            context.interruptedCallsigns = [];
+            context.interrupterCallsign = '';
           },
         },
       },
@@ -87,9 +113,7 @@ export const qsoStateMachine = setup({
       on: {
         CALLSIGN_DETECTED: {
           actions: ({ context, event }) => {
-            const existing = context.detectedCallsigns.find(
-              c => c.callsign === event.callsign
-            );
+            const existing = context.detectedCallsigns.find(c => c.callsign === event.callsign);
             if (!existing) {
               context.detectedCallsigns.push({
                 callsign: event.callsign,
@@ -116,7 +140,6 @@ export const qsoStateMachine = setup({
         SILENCE_TIMEOUT: {
           target: 'idle',
           actions: ({ context }) => {
-            // Reset context on timeout in seeking
             context.detectedCallsigns = [];
             context.dualCallsignsConfirmed = false;
           },
@@ -131,9 +154,7 @@ export const qsoStateMachine = setup({
         },
         RESET: {
           target: 'idle',
-          actions: ({ context }) => {
-            Object.assign(context, initialContext);
-          },
+          actions: ({ context }) => { Object.assign(context, initialContext); },
         },
       },
     },
@@ -144,15 +165,12 @@ export const qsoStateMachine = setup({
           actions: ({ context }) => {
             context.turnCount++;
             context.lastActivityAt = Date.now();
-            // Reduce closing score when new turns arrive
             context.closingScore = Math.max(0, context.closingScore - 0.2);
           },
         },
         CALLSIGN_DETECTED: {
           actions: ({ context, event }) => {
-            const existing = context.detectedCallsigns.find(
-              c => c.callsign === event.callsign
-            );
+            const existing = context.detectedCallsigns.find(c => c.callsign === event.callsign);
             if (!existing) {
               context.detectedCallsigns.push({
                 callsign: event.callsign,
@@ -177,17 +195,77 @@ export const qsoStateMachine = setup({
             target: 'hold',
           },
         ],
+        INTERRUPTION_DETECTED: {
+          target: 'interrupted',
+          actions: ({ context, event }) => {
+            // Snapshot current callsigns before interruption
+            context.interruptedCallsigns = [...context.detectedCallsigns];
+            context.interrupterCallsign = event.interrupterCallsign;
+            context.lastActivityAt = Date.now();
+          },
+        },
         FREQUENCY_CHANGED: {
           target: 'closed',
-          actions: ({ context, event }) => {
-            context.frequency = event.newFrequency;
-          },
+          actions: ({ context, event }) => { context.frequency = event.newFrequency; },
         },
         RESET: {
           target: 'idle',
+          actions: ({ context }) => { Object.assign(context, initialContext); },
+        },
+      },
+    },
+
+    interrupted: {
+      on: {
+        INTERRUPTION_ENDED: {
+          target: 'resuming',
           actions: ({ context }) => {
-            Object.assign(context, initialContext);
+            context.lastActivityAt = Date.now();
           },
+        },
+        TURN_RECEIVED: {
+          actions: ({ context }) => {
+            context.turnCount++;
+            context.lastActivityAt = Date.now();
+          },
+        },
+        SILENCE_TIMEOUT: {
+          target: 'hold',
+        },
+        FREQUENCY_CHANGED: {
+          target: 'closed',
+          actions: ({ context, event }) => { context.frequency = event.newFrequency; },
+        },
+        RESET: {
+          target: 'idle',
+          actions: ({ context }) => { Object.assign(context, initialContext); },
+        },
+      },
+    },
+
+    resuming: {
+      on: {
+        TURN_RECEIVED: {
+          target: 'locked',
+          actions: ({ context }) => {
+            // Restore pre-interruption callsigns
+            context.detectedCallsigns = [...context.interruptedCallsigns];
+            context.interruptedCallsigns = [];
+            context.interrupterCallsign = '';
+            context.turnCount++;
+            context.lastActivityAt = Date.now();
+          },
+        },
+        SILENCE_TIMEOUT: {
+          target: 'hold',
+        },
+        FREQUENCY_CHANGED: {
+          target: 'closed',
+          actions: ({ context, event }) => { context.frequency = event.newFrequency; },
+        },
+        RESET: {
+          target: 'idle',
+          actions: ({ context }) => { Object.assign(context, initialContext); },
         },
       },
     },
@@ -212,15 +290,11 @@ export const qsoStateMachine = setup({
         },
         FREQUENCY_CHANGED: {
           target: 'closed',
-          actions: ({ context, event }) => {
-            context.frequency = event.newFrequency;
-          },
+          actions: ({ context, event }) => { context.frequency = event.newFrequency; },
         },
         RESET: {
           target: 'idle',
-          actions: ({ context }) => {
-            Object.assign(context, initialContext);
-          },
+          actions: ({ context }) => { Object.assign(context, initialContext); },
         },
       },
     },
@@ -236,4 +310,18 @@ export const qsoStateMachine = setup({
  */
 export function createQSOActor() {
   return createActor(qsoStateMachine);
+}
+
+/**
+ * Get frequency change threshold based on operating mode.
+ */
+export function getFrequencyChangeThreshold(mode: string): number {
+  switch (mode.toUpperCase()) {
+    case 'FM':  return 12500; // FM channel spacing
+    case 'AM':  return 5000;
+    case 'USB':
+    case 'LSB': return 1000;  // SSB
+    case 'CW':  return 500;
+    default:    return 1000;
+  }
 }

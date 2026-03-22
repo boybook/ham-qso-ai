@@ -9,7 +9,7 @@ import { AudioIngestionManager } from '../ingestion/AudioIngestionManager.js';
 import { ASRManager } from '../asr/ASRManager.js';
 import { RuleBasedFeatureExtractor, type IFeatureExtractor } from '../extraction/FeatureExtractor.js';
 import { QSOSessionEngine } from '../session/QSOSessionEngine.js';
-import { VotingFieldResolver, type IFieldResolver } from '../resolver/FieldCandidateResolver.js';
+import { getFrequencyChangeThreshold } from '../session/QSOStateMachine.js';
 import { QSODraftEmitter } from '../output/QSODraftEmitter.js';
 
 /**
@@ -25,16 +25,12 @@ export interface QSOPipelineEvents {
 }
 
 /**
- * Main QSO pipeline. Orchestrates all pluggable layers:
+ * Main QSO pipeline.
  *
- * Audio → [Segmenter] → [ASR] → [Feature Extractor] → [Session Engine] → [Field Resolver] → Draft
+ * Audio → [Segmenter] → [ASR] → [Feature Extractor] → [Session Engine] → Draft
  *
- * Each layer is pluggable via config. Defaults:
- * - Segmenter: EnergyVAD (local)
- * - ASR: user-provided (required)
- * - Feature Extractor: RuleBasedFeatureExtractor (local)
- * - Session Engine: QSOSessionEngine (deterministic state machine, not pluggable)
- * - Field Resolver: VotingFieldResolver (candidate pool voting)
+ * Each candidate maintains its own field pools. The pipeline maps
+ * candidate IDs to draft IDs for multi-QSO tracking.
  */
 export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
   private readonly config: QSOPipelineConfig;
@@ -43,10 +39,10 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
   private readonly asrManager: ASRManager;
   private readonly extractor: IFeatureExtractor;
   private readonly sessionEngine: QSOSessionEngine;
-  private readonly resolver: IFieldResolver;
   private readonly draftEmitter: QSODraftEmitter;
-  private currentDraftId: string | null = null;
+  private readonly candidateDraftMap: Map<string, string> = new Map();
   private lastFrequency: number = 0;
+  private lastMode: string = '';
   private started: boolean = false;
 
   constructor(config: QSOPipelineConfig) {
@@ -54,40 +50,33 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     this.config = config;
     this.logger = createLogger('QSOPipeline', config.logger);
 
-    // Segmenter: use provided or default EnergyVAD
     const vad = config.segmenter ?? new EnergyVAD({
       energyThreshold: config.vad?.energyThreshold,
       minSpeechDuration: config.vad?.minSpeechDuration,
       silenceTimeout: config.vad?.silenceTimeout,
     });
 
-    // ASR: always user-provided
     this.asrManager = new ASRManager({
       primary: config.asr.primary,
       fallback: config.asr.fallback,
       logger: config.logger,
     });
 
-    // Feature Extractor: use provided or default rule-based
     this.extractor = config.extractor ?? new RuleBasedFeatureExtractor();
 
-    // Session Engine: deterministic, not pluggable
     this.sessionEngine = new QSOSessionEngine({
       myCallsign: config.session.myCallsign,
-      silenceTimeout: config.sessionTimeout ? Math.min(config.sessionTimeout / 20, 15000) : 15000,
+      silenceTimeout: config.silenceTimeout ?? 15000,
+      holdTimeout: config.holdTimeout ?? 120000,
     });
 
-    // Field Resolver: use provided or default voting-based
-    this.resolver = config.resolver ?? new VotingFieldResolver(config.session.myCallsign);
-
-    // Output
     this.draftEmitter = new QSODraftEmitter();
     this.ingestion = new AudioIngestionManager(vad);
 
     // Wire layers
     this.ingestion.onTurn(turn => this.handleTurn(turn));
-    this.sessionEngine.on('sessionStarted', qsoId => this.handleSessionStarted(qsoId));
-    this.sessionEngine.on('sessionClosed', qsoId => this.handleSessionClosed(qsoId));
+    this.sessionEngine.on('sessionStarted', id => this.handleSessionStarted(id));
+    this.sessionEngine.on('sessionClosed', id => this.handleSessionClosed(id));
   }
 
   async start(): Promise<void> {
@@ -119,15 +108,18 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
 
   pushMetadata(metadata: RadioMetadata): void {
     this.ingestion.pushMetadata(metadata);
-    this.resolver.updateMetadata(metadata.frequency, metadata.mode);
+    this.sessionEngine.updateMetadata(metadata.frequency, metadata.mode);
 
+    // Mode-aware frequency change detection
     if (this.lastFrequency > 0 && metadata.frequency !== this.lastFrequency) {
+      const threshold = getFrequencyChangeThreshold(this.lastMode || metadata.mode);
       const diff = Math.abs(metadata.frequency - this.lastFrequency);
-      if (diff > 1000) {
+      if (diff > threshold) {
         this.sessionEngine.onFrequencyChanged(metadata.frequency);
       }
     }
     this.lastFrequency = metadata.frequency;
+    this.lastMode = metadata.mode;
   }
 
   getActiveDrafts(): QSODraft[] {
@@ -157,7 +149,6 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
 
       if (!asrResult || !asrResult.text.trim()) return;
 
-      // Feature extraction (may be async if LLM-based)
       const features = await this.extractor.extract(asrResult.text, turn.id, {
         knownCallsigns,
         myCallsign: this.config.session.myCallsign,
@@ -172,31 +163,37 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
         asrProvider: asrResult.provider,
         features,
         speaker: turn.direction === 'tx' ? this.config.session.myCallsign : undefined,
+        speakerConfidence: turn.direction === 'tx' ? 1.0 : undefined,
       };
 
+      // Session engine handles routing to the correct candidate
       this.sessionEngine.processTurn(processedTurn);
-      this.resolver.processTurn(processedTurn);
       this.emit('turn:transcribed', processedTurn);
-      this.updateCurrentDraft();
+      this.updatePrimaryDraft();
     } catch (err) {
       this.logger.error('turn processing failed', err);
       this.emit('error', err instanceof Error ? err : new Error(String(err)));
     }
   }
 
-  private handleSessionStarted(_qsoId: string): void {
-    const fields = this.resolver.resolve();
-    const turns = this.sessionEngine.getTurns();
-    const trace = this.sessionEngine.getTrace();
+  private handleSessionStarted(candidateId: string): void {
+    const candidate = this.sessionEngine.getPrimaryCandidate();
+    if (!candidate) return;
+
+    const fields = candidate.resolveFields();
+    const turns = candidate.getTurns();
+    const trace = candidate.getTrace();
     const draft = this.draftEmitter.create(fields, turns, trace);
-    this.currentDraftId = draft.id;
+    this.candidateDraftMap.set(candidateId, draft.id);
     this.emit('qso:draft', draft);
-    this.logger.info('new QSO draft created', { draftId: draft.id });
+    this.logger.info('new QSO draft created', { draftId: draft.id, candidateId });
   }
 
-  private handleSessionClosed(_qsoId: string): void {
-    if (!this.currentDraftId) return;
-    const draft = this.updateCurrentDraft();
+  private handleSessionClosed(candidateId: string): void {
+    const draftId = this.candidateDraftMap.get(candidateId);
+    if (!draftId) return;
+
+    const draft = this.updateDraftForCandidate(candidateId);
     if (draft) {
       this.emit('qso:closed', draft);
       this.logger.info('QSO session closed', {
@@ -204,20 +201,31 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
         callsign: draft.fields.theirCallsign.value,
       });
     }
-    this.currentDraftId = null;
-    this.resolver.clear();
+
+    this.candidateDraftMap.delete(candidateId);
     this.sessionEngine.reset();
   }
 
-  private updateCurrentDraft(): QSODraft | null {
-    if (!this.currentDraftId) return null;
-    const fields = this.resolver.resolve();
-    const turns = this.sessionEngine.getTurns();
-    const trace = this.sessionEngine.getTrace();
-    const previousDraft = this.draftEmitter.get(this.currentDraftId);
+  private updatePrimaryDraft(): void {
+    const primary = this.sessionEngine.getPrimaryCandidate();
+    if (!primary) return;
+    this.updateDraftForCandidate(primary.id);
+  }
+
+  private updateDraftForCandidate(candidateId: string): QSODraft | null {
+    const draftId = this.candidateDraftMap.get(candidateId);
+    if (!draftId) return null;
+
+    const candidate = this.sessionEngine.getPrimaryCandidate();
+    if (!candidate || candidate.id !== candidateId) return null;
+
+    const fields = candidate.resolveFields();
+    const turns = candidate.getTurns();
+    const trace = candidate.getTrace();
+    const previousDraft = this.draftEmitter.get(draftId);
     const previousStatus = previousDraft?.status;
 
-    const draft = this.draftEmitter.update(this.currentDraftId, fields, turns, trace);
+    const draft = this.draftEmitter.update(draftId, fields, turns, trace);
     if (draft) {
       this.emit('qso:updated', draft);
       if (previousStatus === 'draft' && draft.status === 'ready') {

@@ -1,40 +1,39 @@
 import EventEmitter from 'eventemitter3';
-import { createActor, type Actor } from 'xstate';
-import { v4 as uuidv4 } from 'uuid';
+import { createActor } from 'xstate';
 import type { ProcessedTurn } from '../types/turn.js';
-import type { QSODraft, FieldCandidate } from '../types/qso.js';
+import type { FieldCandidate } from '../types/qso.js';
 import type { TraceEntry } from '../types/trace.js';
-import { qsoStateMachine, type QSOState, type QSOEvent, type QSOMachineContext } from './QSOStateMachine.js';
-import { ShadowSessionManager } from './ShadowSession.js';
+import type { QSOCandidateInfo } from '../types/candidate.js';
+import { qsoStateMachine, type QSOState, type QSOMachineContext } from './QSOStateMachine.js';
+import { QSOCandidateManager } from './QSOCandidateManager.js';
+import { QSOCandidate } from './QSOCandidate.js';
 
 /**
  * Events emitted by the QSO session engine.
  */
 export interface QSOSessionEngineEvents {
-  /** State changed */
   'stateChanged': (state: QSOState) => void;
-  /** New QSO session started */
-  'sessionStarted': (qsoId: string) => void;
-  /** QSO session closed */
-  'sessionClosed': (qsoId: string) => void;
-  /** Turn processed */
+  'sessionStarted': (candidateId: string) => void;
+  'sessionClosed': (candidateId: string) => void;
   'turnProcessed': (turn: ProcessedTurn) => void;
 }
 
 /**
- * QSO Session Engine orchestrates the state machine, shadow sessions,
- * and turn processing for tracking QSO lifecycles.
+ * QSO Session Engine orchestrates the state machine and multi-candidate
+ * system for tracking QSO lifecycles.
+ *
+ * Key changes from v1:
+ * - Uses QSOCandidateManager instead of single turns[]/trace[]/resolver
+ * - Session starts at 'locked' (not 'seeking') to avoid premature drafts
+ * - Each candidate independently maintains its own turns, field pools, trace
+ * - Supports interruption detection and candidate competition
  */
 export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
   private actor: ReturnType<typeof createActor<typeof qsoStateMachine>>;
-  private readonly shadowManager: ShadowSessionManager;
+  private readonly candidateManager: QSOCandidateManager;
   private readonly myCallsign: string;
-  private currentQsoId: string | null = null;
-  private turns: ProcessedTurn[] = [];
-  private trace: TraceEntry[] = [];
-  private hasTxTurns: boolean = false;
+  private sessionStartedForPrimary: boolean = false;
 
-  // Timers for silence/hold timeouts
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private holdTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly silenceTimeout: number;
@@ -47,176 +46,167 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
   }) {
     super();
     this.myCallsign = options.myCallsign.toUpperCase();
-    this.silenceTimeout = options.silenceTimeout ?? 15000; // 15s
-    this.holdTimeout = options.holdTimeout ?? 120000; // 2 min
-    this.shadowManager = new ShadowSessionManager();
+    this.silenceTimeout = options.silenceTimeout ?? 15000;
+    this.holdTimeout = options.holdTimeout ?? 120000;
+    this.candidateManager = new QSOCandidateManager({ myCallsign: this.myCallsign });
 
     this.actor = createActor(qsoStateMachine);
+    this.setupActorSubscription();
+  }
+
+  private setupActorSubscription(): void {
     this.actor.subscribe(snapshot => {
       const state = snapshot.value as QSOState;
       this.emit('stateChanged', state);
 
-      if (state === 'seeking' && !this.currentQsoId) {
-        this.currentQsoId = uuidv4();
-        this.emit('sessionStarted', this.currentQsoId);
+      // Session starts at locked (not seeking) to avoid premature drafts
+      if (state === 'locked' && !this.sessionStartedForPrimary) {
+        const primary = this.candidateManager.getPrimary();
+        if (primary) {
+          primary.promote();
+          this.sessionStartedForPrimary = true;
+          this.emit('sessionStarted', primary.id);
+        }
       }
     });
   }
 
-  /**
-   * Start the engine.
-   */
   start(): void {
     this.actor.start();
   }
 
-  /**
-   * Stop the engine.
-   */
   stop(): void {
     this.clearTimers();
     this.actor.stop();
   }
 
-  /**
-   * Get the current state.
-   */
   getState(): QSOState {
     return this.actor.getSnapshot().value as QSOState;
   }
 
-  /**
-   * Get the current context.
-   */
   getContext(): QSOMachineContext {
     return this.actor.getSnapshot().context;
   }
 
   /**
-   * Get current QSO ID.
+   * Get current QSO ID (primary candidate's ID).
    */
   getCurrentQsoId(): string | null {
-    return this.currentQsoId;
+    return this.candidateManager.getPrimary()?.id ?? null;
   }
 
   /**
-   * Get all turns for the current session.
+   * Get turns for the primary candidate.
    */
   getTurns(): ProcessedTurn[] {
-    return [...this.turns];
+    return this.candidateManager.getPrimary()?.getTurns() ?? [];
   }
 
   /**
-   * Get the decision trace.
+   * Get trace for the primary candidate.
    */
   getTrace(): TraceEntry[] {
-    return [...this.trace];
+    return this.candidateManager.getPrimary()?.getTrace() ?? [];
   }
 
   /**
-   * Get shadow sessions.
+   * Get all candidate info.
    */
-  getShadowSessions() {
-    return this.shadowManager.getAll();
+  getCandidates(): QSOCandidateInfo[] {
+    return this.candidateManager.getAllInfo();
+  }
+
+  /**
+   * Get the primary candidate.
+   */
+  getPrimaryCandidate(): QSOCandidate | null {
+    return this.candidateManager.getPrimary();
   }
 
   /**
    * Process a new turn from the pipeline.
    */
   processTurn(turn: ProcessedTurn): void {
-    this.turns.push(turn);
-    if (turn.direction === 'tx') this.hasTxTurns = true;
+    // Route turn to the best-matching candidate
+    const { candidate, isNew } = this.candidateManager.routeTurn(turn);
+    candidate.addTurn(turn);
 
     // Reset silence timer
     this.resetSilenceTimer();
 
-    // Send TURN_RECEIVED event
+    // Drive the global state machine
     this.actor.send({ type: 'TURN_RECEIVED', turn });
 
-    // Process callsign candidates
-    for (const candidate of turn.features.callsignCandidates) {
-      this.processCallsign(candidate, turn);
+    // Process callsign candidates for state machine
+    for (const c of turn.features.callsignCandidates) {
+      this.processCallsign(c, turn, candidate);
     }
 
-    // Process closing signals
+    // Closing signals
     if (turn.features.closingSignals.length > 0) {
       const maxScore = Math.max(...turn.features.closingSignals.map(s => s.confidence));
       this.actor.send({ type: 'CLOSING_DETECTED', score: maxScore });
-      this.addTrace('rule', 'closing_detected', [`Score: ${maxScore}`], turn.id);
+      candidate.addTraceEntry('rule', 'closing_detected', [`Score: ${maxScore}`], turn.id);
+    }
+
+    // Interruption detection: new candidate while locked
+    if (isNew && this.getState() === 'locked') {
+      const newCallsigns = turn.features.callsignCandidates
+        .map(c => c.value.toUpperCase())
+        .filter(cs => cs !== this.myCallsign);
+      if (newCallsigns.length > 0) {
+        this.actor.send({ type: 'INTERRUPTION_DETECTED', interrupterCallsign: newCallsigns[0] });
+        candidate.addTraceEntry('rule', 'interruption_detected', [
+          `Interrupter: ${newCallsigns[0]}`,
+        ], turn.id);
+      }
     }
 
     this.emit('turnProcessed', turn);
-
-    // Check if dual callsigns are confirmed
     this.checkDualCallsigns();
+
+    // Check if a non-primary candidate should be promoted
+    this.candidateManager.checkPromotion();
   }
 
-  /**
-   * Notify the engine of a frequency change.
-   */
   onFrequencyChanged(newFrequency: number): void {
     const currentState = this.getState();
     if (currentState !== 'idle') {
       this.actor.send({ type: 'FREQUENCY_CHANGED', newFrequency });
-      this.addTrace('system', 'frequency_changed', [`New freq: ${newFrequency}`]);
+      const primary = this.candidateManager.getPrimary();
+      primary?.addTraceEntry('system', 'frequency_changed', [`New freq: ${newFrequency}`]);
       this.handleClosed();
     }
   }
 
   /**
-   * Manually reset the session.
+   * Update metadata for all active candidates.
    */
+  updateMetadata(frequency: number, mode: string): void {
+    this.candidateManager.updateMetadata(frequency, mode);
+  }
+
   reset(): void {
     this.clearTimers();
-    // Only send RESET if actor is not in a final state
     const state = this.getState();
     if (state !== 'closed') {
       this.actor.send({ type: 'RESET' });
     } else {
-      // Recreate actor for a fresh session after closed state
       this.actor.stop();
       this.actor = createActor(qsoStateMachine);
-      this.actor.subscribe(snapshot => {
-        const s = snapshot.value as QSOState;
-        this.emit('stateChanged', s);
-        if (s === 'seeking' && !this.currentQsoId) {
-          this.currentQsoId = uuidv4();
-          this.emit('sessionStarted', this.currentQsoId);
-        }
-      });
+      this.setupActorSubscription();
       this.actor.start();
     }
-    this.currentQsoId = null;
-    this.turns = [];
-    this.trace = [];
-    this.hasTxTurns = false;
-    this.shadowManager.clear();
+    this.candidateManager.clear();
+    this.sessionStartedForPrimary = false;
   }
 
-  private processCallsign(candidate: FieldCandidate<string>, turn: ProcessedTurn): void {
+  private processCallsign(candidate: FieldCandidate<string>, turn: ProcessedTurn, qsoCandidate: QSOCandidate): void {
     const callsign = candidate.value.toUpperCase();
     const isMyCallsign = callsign === this.myCallsign;
-
-    // For TX turns, speaker is known = myCallsign
-    // For RX turns with TX present, speaker is likely the other party
     const speakerIsMe = turn.direction === 'tx' || isMyCallsign;
 
     if (!speakerIsMe) {
-      // Check if this is a known callsign BEFORE sending to state machine
-      const state = this.getState();
-      const ctx = this.getContext();
-      const isKnownCallsign = ctx.detectedCallsigns.some(c => c.callsign === callsign);
-
-      // Track in shadow sessions if we're in locked state and it's a new callsign
-      if (state === 'locked' && !isKnownCallsign) {
-        this.shadowManager.report(callsign, candidate.confidence, turn.id);
-        this.addTrace('rule', 'shadow_callsign_tracked', [
-          `Callsign: ${callsign}`,
-          `Confidence: ${candidate.confidence}`,
-        ], turn.id);
-      }
-
-      // Send to state machine (this adds it to detectedCallsigns)
       this.actor.send({
         type: 'CALLSIGN_DETECTED',
         callsign,
@@ -225,7 +215,7 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
       });
     }
 
-    this.addTrace('rule', 'callsign_processed', [
+    qsoCandidate.addTraceEntry('rule', 'callsign_processed', [
       `Callsign: ${callsign}`,
       `Direction: ${turn.direction}`,
       `IsMyCallsign: ${isMyCallsign}`,
@@ -239,26 +229,24 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
     if (state !== 'seeking') return;
     if (ctx.dualCallsignsConfirmed) return;
 
-    // In participate mode (hasTxTurns), we need myCallsign + one other
-    // In monitor mode (no TX), we need at least 2 different callsigns
-    const uniqueCallsigns = new Set(ctx.detectedCallsigns.map(c => c.callsign));
+    const primary = this.candidateManager.getPrimary();
+    if (!primary) return;
 
-    if (this.hasTxTurns) {
-      // We know we're one party, just need one other callsign
+    const uniqueCallsigns = new Set(ctx.detectedCallsigns.map(c => c.callsign));
+    const hasTx = primary.hasTxTurns;
+
+    if (hasTx) {
       if (uniqueCallsigns.size >= 1) {
         this.actor.send({ type: 'DUAL_CALLSIGNS_CONFIRMED' });
-        this.addTrace('rule', 'dual_callsigns_confirmed', [
-          `Mode: participate`,
-          `Callsigns: ${[...uniqueCallsigns].join(', ')}`,
+        primary.addTraceEntry('rule', 'dual_callsigns_confirmed', [
+          `Mode: participate`, `Callsigns: ${[...uniqueCallsigns].join(', ')}`,
         ]);
       }
     } else {
-      // Monitor mode: need at least 2 distinct callsigns
       if (uniqueCallsigns.size >= 2) {
         this.actor.send({ type: 'DUAL_CALLSIGNS_CONFIRMED' });
-        this.addTrace('rule', 'dual_callsigns_confirmed', [
-          `Mode: monitor`,
-          `Callsigns: ${[...uniqueCallsigns].join(', ')}`,
+        primary.addTraceEntry('rule', 'dual_callsigns_confirmed', [
+          `Mode: monitor`, `Callsigns: ${[...uniqueCallsigns].join(', ')}`,
         ]);
       }
     }
@@ -270,17 +258,14 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
 
     this.silenceTimer = setTimeout(() => {
       const state = this.getState();
-      if (state === 'seeking' || state === 'locked') {
+      if (state === 'seeking' || state === 'locked' || state === 'interrupted' || state === 'resuming') {
         this.actor.send({ type: 'SILENCE_TIMEOUT' });
 
-        if (state === 'locked') {
-          // If moved to hold, start hold timer
-          const newState = this.getState();
-          if (newState === 'hold') {
-            this.startHoldTimer();
-          } else if (newState === 'closed') {
-            this.handleClosed();
-          }
+        const newState = this.getState();
+        if (newState === 'hold') {
+          this.startHoldTimer();
+        } else if (newState === 'closed') {
+          this.handleClosed();
         }
       }
     }, this.silenceTimeout);
@@ -296,11 +281,13 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
   }
 
   private handleClosed(): void {
-    if (this.currentQsoId) {
-      this.emit('sessionClosed', this.currentQsoId);
-      this.addTrace('system', 'session_closed', [
-        `QSO ID: ${this.currentQsoId}`,
-        `Turns: ${this.turns.length}`,
+    const primary = this.candidateManager.getPrimary();
+    if (primary) {
+      primary.close();
+      this.emit('sessionClosed', primary.id);
+      primary.addTraceEntry('system', 'session_closed', [
+        `Candidate ID: ${primary.id}`,
+        `Turns: ${primary.turnCount}`,
       ]);
     }
   }
@@ -308,21 +295,5 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
   private clearTimers(): void {
     if (this.silenceTimer) { clearTimeout(this.silenceTimer); this.silenceTimer = null; }
     if (this.holdTimer) { clearTimeout(this.holdTimer); this.holdTimer = null; }
-  }
-
-  private addTrace(
-    actor: TraceEntry['actor'],
-    action: string,
-    reasons: string[],
-    turnId?: string,
-  ): void {
-    this.trace.push({
-      timestamp: Date.now(),
-      actor,
-      action,
-      reasons,
-      qsoId: this.currentQsoId ?? undefined,
-      turnId,
-    });
   }
 }

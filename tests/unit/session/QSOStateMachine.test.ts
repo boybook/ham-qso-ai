@@ -189,4 +189,83 @@ describe('QSOStateMachine', () => {
       actor.stop();
     });
   });
+
+  describe('interrupted state', () => {
+    function toLocked(actor: ReturnType<typeof createTestActor>) {
+      actor.send({ type: 'CALLSIGN_DETECTED', callsign: 'W1AW', direction: 'rx', confidence: 0.8 });
+      actor.send({ type: 'DUAL_CALLSIGNS_CONFIRMED' });
+    }
+
+    it('should transition locked → interrupted on INTERRUPTION_DETECTED', () => {
+      const actor = createTestActor();
+      toLocked(actor);
+      actor.send({ type: 'INTERRUPTION_DETECTED', interrupterCallsign: 'JA1ABC' });
+      expect(getState(actor)).toBe('interrupted');
+      expect(actor.getSnapshot().context.interrupterCallsign).toBe('JA1ABC');
+      expect(actor.getSnapshot().context.interruptedCallsigns).toHaveLength(1);
+      actor.stop();
+    });
+
+    it('should transition interrupted → resuming on INTERRUPTION_ENDED', () => {
+      const actor = createTestActor();
+      toLocked(actor);
+      actor.send({ type: 'INTERRUPTION_DETECTED', interrupterCallsign: 'JA1ABC' });
+      actor.send({ type: 'INTERRUPTION_ENDED' });
+      expect(getState(actor)).toBe('resuming');
+      actor.stop();
+    });
+
+    it('should transition interrupted → hold on SILENCE_TIMEOUT', () => {
+      const actor = createTestActor();
+      toLocked(actor);
+      actor.send({ type: 'INTERRUPTION_DETECTED', interrupterCallsign: 'JA1ABC' });
+      actor.send({ type: 'SILENCE_TIMEOUT' });
+      expect(getState(actor)).toBe('hold');
+      actor.stop();
+    });
+
+    it('should transition interrupted → closed on FREQUENCY_CHANGED', () => {
+      const actor = createTestActor();
+      toLocked(actor);
+      actor.send({ type: 'INTERRUPTION_DETECTED', interrupterCallsign: 'JA1ABC' });
+      actor.send({ type: 'FREQUENCY_CHANGED', newFrequency: 7100000 });
+      expect(getState(actor)).toBe('closed');
+      actor.stop();
+    });
+  });
+
+  describe('resuming state', () => {
+    function toResuming(actor: ReturnType<typeof createTestActor>) {
+      actor.send({ type: 'CALLSIGN_DETECTED', callsign: 'W1AW', direction: 'rx', confidence: 0.8 });
+      actor.send({ type: 'DUAL_CALLSIGNS_CONFIRMED' });
+      actor.send({ type: 'INTERRUPTION_DETECTED', interrupterCallsign: 'JA1ABC' });
+      actor.send({ type: 'INTERRUPTION_ENDED' });
+    }
+
+    it('should transition resuming → locked on TURN_RECEIVED', () => {
+      const actor = createTestActor();
+      toResuming(actor);
+      actor.send({ type: 'TURN_RECEIVED', turn: {} as any });
+      expect(getState(actor)).toBe('locked');
+      // Should restore pre-interruption callsigns
+      expect(actor.getSnapshot().context.interrupterCallsign).toBe('');
+      actor.stop();
+    });
+
+    it('should transition resuming → hold on SILENCE_TIMEOUT', () => {
+      const actor = createTestActor();
+      toResuming(actor);
+      actor.send({ type: 'SILENCE_TIMEOUT' });
+      expect(getState(actor)).toBe('hold');
+      actor.stop();
+    });
+
+    it('should transition resuming → closed on FREQUENCY_CHANGED', () => {
+      const actor = createTestActor();
+      toResuming(actor);
+      actor.send({ type: 'FREQUENCY_CHANGED', newFrequency: 7100000 });
+      expect(getState(actor)).toBe('closed');
+      actor.stop();
+    });
+  });
 });

@@ -38,7 +38,8 @@ async function simulateQSO(
       minSpeechDuration: 50,
       silenceTimeout: 200,
     },
-    sessionTimeout: 5000,
+    silenceTimeout: 5000,
+    holdTimeout: 10000,
   });
 
   const events: { type: string; draft?: QSODraft; turn?: ProcessedTurn }[] = [];
