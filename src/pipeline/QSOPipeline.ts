@@ -138,16 +138,21 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
 
   private async handleTurn(turn: Turn): Promise<void> {
     try {
-      const ctx = this.sessionEngine.getContext();
-      const knownCallsigns = ctx.detectedCallsigns.map(c => c.callsign);
-      const prompt = [this.config.session.myCallsign, ...knownCallsigns].join(' ');
+      // ASR prompt: only myCallsign globally.
+      // Candidate-specific callsigns go into extraction context, not ASR prompt,
+      // to avoid polluting ASR with competing candidates' callsigns.
+      const asrPrompt = this.config.session.myCallsign;
 
       const asrResult = await this.asrManager.transcribe(
         turn.audio, turn.sampleRate,
-        { language: this.config.session.languageHint, prompt },
+        { language: this.config.session.languageHint, prompt: asrPrompt },
       );
 
       if (!asrResult || !asrResult.text.trim()) return;
+
+      // Extraction context: primary candidate's callsigns for context-aware extraction
+      const primary = this.sessionEngine.getPrimaryCandidate();
+      const knownCallsigns = primary ? [...primary.callsigns] : [];
 
       const features = await this.extractor.extract(asrResult.text, turn.id, {
         knownCallsigns,
@@ -203,7 +208,14 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     }
 
     this.candidateDraftMap.delete(candidateId);
-    this.sessionEngine.reset();
+
+    // Only reset engine if no other active candidates remain.
+    // Otherwise, other candidates continue to be tracked.
+    const activeCandidates = this.sessionEngine.getCandidates()
+      .filter(c => c.status === 'candidate' || c.status === 'active');
+    if (activeCandidates.length === 0) {
+      this.sessionEngine.reset();
+    }
   }
 
   private updatePrimaryDraft(): void {
@@ -216,8 +228,9 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     const draftId = this.candidateDraftMap.get(candidateId);
     if (!draftId) return null;
 
-    const candidate = this.sessionEngine.getPrimaryCandidate();
-    if (!candidate || candidate.id !== candidateId) return null;
+    // Look up the specific candidate by ID, not just primary
+    const candidate = this.sessionEngine.getCandidate(candidateId);
+    if (!candidate) return null;
 
     const fields = candidate.resolveFields();
     const turns = candidate.getTurns();

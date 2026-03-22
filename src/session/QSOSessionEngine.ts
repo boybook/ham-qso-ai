@@ -124,6 +124,13 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
   }
 
   /**
+   * Get a candidate by ID (any candidate, not just primary).
+   */
+  getCandidate(candidateId: string): QSOCandidate | null {
+    return this.candidateManager.get(candidateId);
+  }
+
+  /**
    * Process a new turn from the pipeline.
    */
   processTurn(turn: ProcessedTurn): void {
