@@ -1,0 +1,21 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test fixtures - real recordings (user-provided, not distributed)
+tests/fixtures/recordings/
+
+# Coverage
+coverage/
