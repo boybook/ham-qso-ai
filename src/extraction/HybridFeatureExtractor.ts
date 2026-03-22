@@ -73,40 +73,31 @@ export class HybridFeatureExtractor implements IFeatureExtractor {
    *   (i.e., the turn appears to have meaningful content but rules found almost nothing)
    */
   private evaluate(features: TurnFeatures): { needsLLM: boolean; reason: string } {
-    // Check callsigns
     const bestCallsignConf = Math.max(
       0,
       ...features.callsignCandidates.map(c => c.confidence),
     );
 
+    // Callsign is the MOST IMPORTANT field. Always invoke LLM when missing.
     if (features.callsignCandidates.length === 0) {
-      // No callsign found at all — might be expressed in a way rules don't handle
-      // But only trigger LLM if there are also no signals (otherwise it might just be a "roger" turn)
-      const hasAnySignal =
-        features.closingSignals.length > 0 ||
-        features.continuationSignals.length > 0 ||
-        features.qsoStartSignals.length > 0;
+      // Only skip LLM for pure signal turns (just "roger"/"73"/"CQ" with nothing else)
+      const hasOnlySignals =
+        (features.closingSignals.length > 0 ||
+         features.continuationSignals.length > 0 ||
+         features.qsoStartSignals.length > 0) &&
+        features.rstCandidates.length === 0;
 
-      if (!hasAnySignal) {
-        return { needsLLM: true, reason: 'no callsign and no signals from rules' };
+      if (hasOnlySignals) {
+        return { needsLLM: false, reason: '' };
       }
-    } else if (bestCallsignConf < this.confidenceThreshold) {
+      return { needsLLM: true, reason: 'no callsign from rules' };
+    }
+
+    if (bestCallsignConf < this.confidenceThreshold) {
       return { needsLLM: true, reason: `callsign confidence too low: ${bestCallsignConf}` };
     }
 
-    // Check RST — only trigger LLM if no callsign AND no RST AND no signals.
-    // RST absence alone is normal (many turns don't mention RST).
-    if (features.rstCandidates.length === 0 && features.callsignCandidates.length === 0) {
-      const hasAnySignal =
-        features.closingSignals.length > 0 ||
-        features.continuationSignals.length > 0 ||
-        features.qsoStartSignals.length > 0;
-      if (!hasAnySignal) {
-        return { needsLLM: true, reason: 'no callsign, no RST, and no signals from rules' };
-      }
-    }
-
-    // Rules extracted enough key data — skip LLM
+    // Rules extracted a good callsign — skip LLM
     return { needsLLM: false, reason: '' };
   }
 

@@ -28,23 +28,16 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-import {
-  QSOPipeline,
-  WhisperProvider,
-  OpenAICompatibleProvider,
-  HybridFeatureExtractor,
-  RuleBasedFeatureExtractor,
-  LLMFeatureExtractor,
-  SyllabicVAD,
-} from '../src/index.js';
+import { createPipeline } from '../src/index.js';
 import type { QSODraft, ProcessedTurn } from '../src/index.js';
 
 const __dirname = __dirname2;
 
 // ─── Config ──────────────────────────────────────────────────────
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.error('Error: OPENAI_API_KEY environment variable is required');
+const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY;
+if (!OPENAI_API_KEY && !DASHSCOPE_API_KEY) {
+  console.error('Error: OPENAI_API_KEY or DASHSCOPE_API_KEY environment variable is required');
   process.exit(1);
 }
 
@@ -100,44 +93,17 @@ function readWav(filePath: string): { samples: Float32Array; sampleRate: number 
 async function main() {
   const { samples, sampleRate } = readWav(WAV_PATH);
 
-  // Create providers
-  const whisper = new WhisperProvider({
-    apiKey: OPENAI_API_KEY!,
-    model: 'whisper-1',
-  });
+  // Create pipeline with factory function — one line setup
+  const useDashScope = !!DASHSCOPE_API_KEY;
+  const preset = useDashScope ? 'dashscope' : 'openai';
+  const apiKey = useDashScope ? DASHSCOPE_API_KEY! : OPENAI_API_KEY!;
 
-  const llm = new OpenAICompatibleProvider({
-    apiKey: OPENAI_API_KEY!,
-    model: 'gpt-4o-mini',
-  });
+  console.log(`Using preset: ${preset}`);
 
-  // Initialize LLM provider
-  await llm.initialize();
-
-  // Create pipeline with hybrid extraction
-  const pipeline = new QSOPipeline({
-    asr: { primary: whisper },
-    llm: { provider: llm },
-    session: {
-      myCallsign: 'LISTENER', // SWL / monitor mode
-      languageHint: 'zh',
-    },
-    extractor: new HybridFeatureExtractor(
-      new RuleBasedFeatureExtractor(),
-      new LLMFeatureExtractor(llm),
-    ),
-    // SyllabicVAD: adaptive noise floor + syllabic modulation detection
-    // Handles AGC-raised noise floor in real radio audio
-    segmenter: new SyllabicVAD({
-      minSpeechDuration: 500,
-      silenceTimeout: 2000,
-      maxTurnDuration: 30000,
-      snrThresholdDb: 4,                // 4dB above noise floor
-      noiseFloorAlpha: 0.01,            // Slow noise floor tracking
-      syllabicModulationThreshold: 0.1,
-    }),
-    silenceTimeout: 20000,
-    holdTimeout: 60000,
+  const pipeline = createPipeline(preset as 'dashscope' | 'openai', {
+    apiKey,
+    myCallsign: 'LISTENER',
+    languageHint: 'zh',
   });
 
   // Track events
@@ -224,11 +190,9 @@ async function main() {
     await new Promise(r => setTimeout(r, 10));
   }
 
-  // Wait for final processing
-  console.log('\nWaiting for final processing...');
-  await new Promise(r => setTimeout(r, 5000));
-
-  // Flush and stop
+  // stop() flushes VAD and drains the turn processing queue.
+  // All enqueued turns will be fully processed before stop() resolves.
+  console.log('\nStopping pipeline (draining turn queue)...');
   await pipeline.stop();
 
   // Print summary
@@ -252,13 +216,15 @@ async function main() {
 function printDraft(draft: QSODraft, label: string) {
   const f = draft.fields;
   console.log(`\n--- ${label} Draft [${draft.status}] ---`);
+  if (f.stationCallsigns && f.stationCallsigns.length > 1) {
+    console.log(`  Stations:       ${f.stationCallsigns.map(c => `${c.value}(${c.confidence.toFixed(2)})`).join(' ↔ ')}`);
+  }
   console.log(`  Their Callsign: ${f.theirCallsign.value || '?'} (conf: ${f.theirCallsign.confidence.toFixed(2)})`);
   console.log(`  RST Sent:       ${f.rstSent.value} (conf: ${f.rstSent.confidence.toFixed(2)})`);
   console.log(`  RST Received:   ${f.rstReceived.value} (conf: ${f.rstReceived.confidence.toFixed(2)})`);
   console.log(`  Frequency:      ${f.frequency.value ? (f.frequency.value / 1000000).toFixed(3) + ' MHz' : '?'}`);
   console.log(`  Mode:           ${f.mode.value || '?'}`);
   console.log(`  My Callsign:    ${f.myCallsign.value}`);
-  if (f.theirName?.value) console.log(`  Their Name:     ${f.theirName.value}`);
   if (f.theirQTH?.value) console.log(`  Their QTH:      ${f.theirQTH.value}`);
   if (f.theirGrid?.value) console.log(`  Their Grid:     ${f.theirGrid.value}`);
   console.log(`  Turns:          ${draft.turns.length}`);

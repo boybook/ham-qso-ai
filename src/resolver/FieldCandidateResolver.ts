@@ -82,10 +82,25 @@ export class VotingFieldResolver implements IFieldResolver {
   }
 
   resolve(): QSOFields {
+    const callsignResolved = this.theirCallsign.resolve();
+
+    // In monitor mode, collect all distinct station callsigns (not just the best one)
+    let stationCallsigns: QSOFields['stationCallsigns'];
+    if (callsignResolved?.candidates && callsignResolved.candidates.length > 1) {
+      stationCallsigns = callsignResolved.candidates
+        .filter(c => c.confidence > 0.3)
+        .map(c => ({
+          value: c.value as string,
+          confidence: c.confidence,
+          source: c.source,
+        }));
+    }
+
     return {
-      theirCallsign: this.theirCallsign.resolve() ?? {
+      theirCallsign: callsignResolved ?? {
         value: '', confidence: 0, source: 'rule',
       },
+      stationCallsigns,
       rstSent: this.rstSent.resolve() ?? {
         value: '59', confidence: 0.3, source: 'rule',
       },

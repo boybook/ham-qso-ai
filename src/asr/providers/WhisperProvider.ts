@@ -63,10 +63,12 @@ export class WhisperProvider implements IASRProvider {
     const file = new File([wavBuffer], 'audio.wav', { type: 'audio/wav' });
 
     const model = this.config.model ?? 'whisper-1';
+    // gpt-4o-transcribe doesn't support verbose_json, use json instead
+    const isGpt4oTranscribe = model.startsWith('gpt-4o');
     const requestParams: Record<string, unknown> = {
       file,
       model,
-      response_format: 'verbose_json',
+      response_format: isGpt4oTranscribe ? 'json' : 'verbose_json',
     };
 
     if (options?.language) {

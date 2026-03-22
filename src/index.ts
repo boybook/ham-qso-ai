@@ -25,6 +25,9 @@ export type {
   ILLMProvider,
   LLMResult,
   LLMOptions,
+  ITurnProcessor,
+  TurnProcessorResult,
+  ContextUpdate,
 } from './types/providers.js';
 
 export type {
@@ -79,6 +82,7 @@ export { ASRManager } from './asr/ASRManager.js';
 export { NullASRProvider } from './asr/providers/NullProvider.js';
 export { WhisperProvider } from './asr/providers/WhisperProvider.js';
 export { DashScopeASRProvider } from './asr/providers/DashScopeASRProvider.js';
+export { Qwen3ASRProvider } from './asr/providers/Qwen3ASRProvider.js';
 
 // LLM (ILLMProvider implementations)
 export { LLMManager } from './llm/LLMManager.js';
@@ -91,9 +95,16 @@ export { QSOCandidate } from './session/QSOCandidate.js';
 export { QSOCandidateManager } from './session/QSOCandidateManager.js';
 export { getFrequencyChangeThreshold } from './session/QSOStateMachine.js';
 
+// Turn Processors (ITurnProcessor implementations)
+export { ChainedTurnProcessor } from './processor/ChainedTurnProcessor.js';
+export { ChainedConversationProcessor } from './processor/ChainedConversationProcessor.js';
+export { OmniConversationProcessor } from './processor/OmniConversationProcessor.js';
+
 // Pipeline
 export { QSOPipeline } from './pipeline/QSOPipeline.js';
 export type { QSOPipelineEvents } from './pipeline/QSOPipeline.js';
+export { createPipeline } from './pipeline/createPipeline.js';
+export type { PresetOptions } from './pipeline/createPipeline.js';
 
 // Output
 export { QSODraftEmitter } from './output/QSODraftEmitter.js';

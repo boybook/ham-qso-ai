@@ -1,4 +1,4 @@
-import type { IASRProvider, ILLMProvider } from './providers.js';
+import type { IASRProvider, ILLMProvider, ITurnProcessor } from './providers.js';
 import type { SessionMetadata } from './audio.js';
 import type { ILogger } from '../utils/logger.js';
 import type { IFeatureExtractor } from '../extraction/FeatureExtractor.js';
@@ -7,12 +7,25 @@ import type { IVAD } from '../segmentation/types.js';
 /**
  * Configuration for the QSO pipeline.
  *
- * Every processing stage is pluggable: provide your own implementation
- * or use the built-in defaults.
+ * Two modes of operation:
+ *
+ * 1. **Unified processor** (recommended): Set `processor` to an ITurnProcessor
+ *    implementation. Handles ASR + extraction in one step. Use createPipeline()
+ *    factory for the simplest setup.
+ *
+ * 2. **Legacy mode**: Set `asr` (and optionally `extractor`/`llm`) for the
+ *    traditional ASR → FeatureExtractor chain. Automatically wrapped into
+ *    a ChainedTurnProcessor internally.
  */
 export interface QSOPipelineConfig {
-  /** ASR provider configuration (required) */
-  asr: {
+  /**
+   * Unified turn processor (recommended).
+   * When set, replaces the asr + extractor chain.
+   */
+  processor?: ITurnProcessor;
+
+  /** ASR provider configuration (required in legacy mode, ignored if processor is set) */
+  asr?: {
     primary: IASRProvider;
     fallback?: IASRProvider;
   };

@@ -75,6 +75,12 @@ export class OpenAICompatibleProvider implements ILLMProvider {
       requestParams.response_format = { type: 'json_object' };
     }
 
+    // Qwen3/3.5 models have thinking mode enabled by default.
+    // Disable it for fast extraction tasks.
+    if (model.startsWith('qwen3')) {
+      requestParams.enable_thinking = false;
+    }
+
     try {
       const response = await this.client.chat.completions.create(requestParams);
       const choice = response.choices?.[0];

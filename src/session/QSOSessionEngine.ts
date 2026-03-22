@@ -176,6 +176,31 @@ export class QSOSessionEngine extends EventEmitter<QSOSessionEngineEvents> {
     this.candidateManager.checkPromotion();
   }
 
+  /**
+   * Process late-arriving features (e.g., from async LLM).
+   * Feeds callsigns and signals into the primary candidate and state machine
+   * without creating a new turn.
+   */
+  processLateFeatures(features: import('../types/turn.js').TurnFeatures): void {
+    const candidate = this.candidateManager.getPrimary();
+
+    for (const c of features.callsignCandidates) {
+      const cs = c.value.toUpperCase();
+      if (cs !== this.myCallsign) {
+        candidate?.registerCallsign(cs);
+        // Drive state machine
+        this.actor.send({ type: 'CALLSIGN_DETECTED', callsign: cs, direction: 'rx', confidence: c.confidence });
+      }
+    }
+
+    if (features.closingSignals.length > 0) {
+      const maxScore = Math.max(...features.closingSignals.map(s => s.confidence));
+      this.actor.send({ type: 'CLOSING_DETECTED', score: maxScore });
+    }
+
+    this.checkDualCallsigns();
+  }
+
   onFrequencyChanged(newFrequency: number): void {
     const currentState = this.getState();
     if (currentState !== 'idle') {

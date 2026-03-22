@@ -67,8 +67,18 @@ export class QSOCandidateManager {
       return { candidate: bestCandidate, isNew: false };
     }
 
-    // No good match — try to create new candidate if turn has callsigns
+    // No good match — if primary has no callsigns yet, adopt this turn's callsigns
+    // instead of creating a new candidate (common in the early phase of a QSO)
     if (turnCallsigns.length > 0) {
+      const primary = this.getPrimary();
+      if (primary && primary.callsigns.size === 0
+        && (primary.getStatus() === 'candidate' || primary.getStatus() === 'active')) {
+        for (const cs of turnCallsigns) {
+          primary.registerCallsign(cs);
+        }
+        return { candidate: primary, isNew: false };
+      }
+
       const newCandidate = this.createCandidate(turnCallsigns[0]);
       for (const cs of turnCallsigns.slice(1)) {
         newCandidate.registerCallsign(cs);

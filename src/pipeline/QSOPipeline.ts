@@ -3,11 +3,13 @@ import type { AudioChunk, RadioMetadata } from '../types/audio.js';
 import type { QSOPipelineConfig } from '../types/config.js';
 import type { QSODraft } from '../types/qso.js';
 import type { ProcessedTurn, Turn } from '../types/turn.js';
+import type { ITurnProcessor } from '../types/providers.js';
 import { createLogger, type ILogger } from '../utils/logger.js';
 import { EnergyVAD } from '../segmentation/EnergyVAD.js';
 import { AudioIngestionManager } from '../ingestion/AudioIngestionManager.js';
+import { ChainedTurnProcessor } from '../processor/ChainedTurnProcessor.js';
+import { ChainedConversationProcessor } from '../processor/ChainedConversationProcessor.js';
 import { ASRManager } from '../asr/ASRManager.js';
-import { RuleBasedFeatureExtractor, type IFeatureExtractor } from '../extraction/FeatureExtractor.js';
 import { QSOSessionEngine } from '../session/QSOSessionEngine.js';
 import { getFrequencyChangeThreshold } from '../session/QSOStateMachine.js';
 import { QSODraftEmitter } from '../output/QSODraftEmitter.js';
@@ -27,23 +29,30 @@ export interface QSOPipelineEvents {
 /**
  * Main QSO pipeline.
  *
- * Audio → [Segmenter] → [ASR] → [Feature Extractor] → [Session Engine] → Draft
+ * Audio → [Segmenter] → [Turn Processor] → [Session Engine] → Draft
  *
- * Each candidate maintains its own field pools. The pipeline maps
- * candidate IDs to draft IDs for multi-QSO tracking.
+ * The turn processor is a unified abstraction that handles both ASR
+ * and feature extraction. Three modes:
+ * - OmniConversationProcessor: multimodal LLM conversation (recommended)
+ * - ChainedTurnProcessor: ASR + extractor chain (legacy compatible)
+ * - Any custom ITurnProcessor implementation
  */
 export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
   private readonly config: QSOPipelineConfig;
   private readonly logger: ILogger;
   private readonly ingestion: AudioIngestionManager;
-  private readonly asrManager: ASRManager;
-  private readonly extractor: IFeatureExtractor;
+  private readonly processor: ITurnProcessor;
   private readonly sessionEngine: QSOSessionEngine;
   private readonly draftEmitter: QSODraftEmitter;
   private readonly candidateDraftMap: Map<string, string> = new Map();
   private lastFrequency: number = 0;
   private lastMode: string = '';
   private started: boolean = false;
+
+  // Async turn queue: ensures sequential processing + clean drain on stop
+  private readonly turnQueue: Turn[] = [];
+  private processing: boolean = false;
+  private drainResolvers: Array<() => void> = [];
 
   constructor(config: QSOPipelineConfig) {
     super();
@@ -56,13 +65,26 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
       silenceTimeout: config.vad?.silenceTimeout,
     });
 
-    this.asrManager = new ASRManager({
-      primary: config.asr.primary,
-      fallback: config.asr.fallback,
-      logger: config.logger,
-    });
-
-    this.extractor = config.extractor ?? new RuleBasedFeatureExtractor();
+    // Resolve turn processor: unified or legacy
+    if (config.processor) {
+      this.processor = config.processor;
+    } else if (config.asr) {
+      // Backward compatible: wrap ASR + extractor into ChainedTurnProcessor
+      // Use ASRManager to support primary + fallback
+      this.processor = new ChainedTurnProcessor({
+        asr: new ASRManager({
+          primary: config.asr.primary,
+          fallback: config.asr.fallback,
+          logger: config.logger,
+        }),
+        extractor: config.extractor,
+        language: config.session.languageHint,
+        myCallsign: config.session.myCallsign,
+        logger: config.logger,
+      });
+    } else {
+      throw new Error('QSOPipelineConfig must provide either "processor" or "asr"');
+    }
 
     this.sessionEngine = new QSOSessionEngine({
       myCallsign: config.session.myCallsign,
@@ -73,15 +95,32 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     this.draftEmitter = new QSODraftEmitter();
     this.ingestion = new AudioIngestionManager(vad);
 
-    // Wire layers
-    this.ingestion.onTurn(turn => this.handleTurn(turn));
+    // Wire layers — enqueue turns for sequential async processing
+    this.ingestion.onTurn(turn => this.enqueueTurn(turn));
     this.sessionEngine.on('sessionStarted', id => this.handleSessionStarted(id));
     this.sessionEngine.on('sessionClosed', id => this.handleSessionClosed(id));
   }
 
   async start(): Promise<void> {
     if (this.started) return;
-    await this.asrManager.initialize();
+    await this.processor.initialize();
+
+    // Wire late-arriving LLM features (for ChainedConversationProcessor)
+    if (this.processor instanceof ChainedConversationProcessor) {
+      this.processor.onLateFeatures = (_text, features) => {
+        // Feed LLM-discovered callsigns into session engine
+        // This may trigger state transitions (seeking→locked, etc.)
+        if (features.callsignCandidates.length > 0) {
+          this.processor.updateContext({
+            knownCallsigns: features.callsignCandidates.map(c => c.value),
+          });
+          // Re-process features through session engine as a synthetic turn update
+          this.sessionEngine.processLateFeatures(features);
+        }
+        this.updatePrimaryDraft();
+      };
+    }
+
     this.sessionEngine.start();
     this.started = true;
     this.logger.info('pipeline started');
@@ -90,6 +129,8 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.ingestion.flush();
+    // Wait for the queue to drain (all enqueued turns fully processed)
+    await this.drain();
     this.sessionEngine.stop();
     this.started = false;
     this.logger.info('pipeline stopped');
@@ -97,7 +138,7 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
 
   async dispose(): Promise<void> {
     await this.stop();
-    await this.asrManager.dispose();
+    await this.processor.dispose();
     this.logger.info('pipeline disposed');
   }
 
@@ -110,12 +151,19 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     this.ingestion.pushMetadata(metadata);
     this.sessionEngine.updateMetadata(metadata.frequency, metadata.mode);
 
+    // Push metadata to processor for context
+    this.processor.updateContext({
+      frequency: metadata.frequency,
+      mode: metadata.mode,
+    });
+
     // Mode-aware frequency change detection
     if (this.lastFrequency > 0 && metadata.frequency !== this.lastFrequency) {
       const threshold = getFrequencyChangeThreshold(this.lastMode || metadata.mode);
       const diff = Math.abs(metadata.frequency - this.lastFrequency);
       if (diff > threshold) {
         this.sessionEngine.onFrequencyChanged(metadata.frequency);
+        this.processor.reset(); // New frequency = new conversation
       }
     }
     this.lastFrequency = metadata.frequency;
@@ -136,42 +184,80 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     this.draftEmitter.discard(draftId);
   }
 
+  // ─── Turn queue ──────────────────────────────────────────────
+
+  /**
+   * Enqueue a turn for sequential async processing.
+   * VAD calls this synchronously; the queue ensures turns are processed
+   * one at a time (important for conversation context ordering).
+   */
+  private enqueueTurn(turn: Turn): void {
+    this.turnQueue.push(turn);
+    this.processQueue();
+  }
+
+  /**
+   * Process turns from the queue one at a time.
+   * If already processing, this is a no-op (the current loop will pick up new items).
+   */
+  private async processQueue(): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    try {
+      while (this.turnQueue.length > 0) {
+        const turn = this.turnQueue.shift()!;
+        await this.handleTurn(turn);
+      }
+    } finally {
+      this.processing = false;
+      // Notify anyone waiting for drain
+      for (const resolve of this.drainResolvers) resolve();
+      this.drainResolvers = [];
+    }
+  }
+
+  /**
+   * Returns a Promise that resolves when the queue is empty and
+   * no turn is being processed. Resolves immediately if already idle.
+   */
+  private drain(): Promise<void> {
+    if (!this.processing && this.turnQueue.length === 0) {
+      return Promise.resolve();
+    }
+    this.logger.info('draining turn queue', {
+      queued: this.turnQueue.length,
+      processing: this.processing,
+    });
+    return new Promise<void>(resolve => {
+      this.drainResolvers.push(resolve);
+    });
+  }
+
+  // ─── Turn processing ─────────────────────────────────────────
+
   private async handleTurn(turn: Turn): Promise<void> {
     try {
-      // ASR prompt: only myCallsign globally.
-      // Candidate-specific callsigns go into extraction context, not ASR prompt,
-      // to avoid polluting ASR with competing candidates' callsigns.
-      const asrPrompt = this.config.session.myCallsign;
+      const result = await this.processor.processTurn(turn.audio, turn.sampleRate);
+      if (!result.text.trim()) return;
 
-      const asrResult = await this.asrManager.transcribe(
-        turn.audio, turn.sampleRate,
-        { language: this.config.session.languageHint, prompt: asrPrompt },
-      );
-
-      if (!asrResult || !asrResult.text.trim()) return;
-
-      // Extraction context: primary candidate's callsigns for context-aware extraction
-      const primary = this.sessionEngine.getPrimaryCandidate();
-      const knownCallsigns = primary ? [...primary.callsigns] : [];
-
-      const features = await this.extractor.extract(asrResult.text, turn.id, {
-        knownCallsigns,
-        myCallsign: this.config.session.myCallsign,
-        frequency: this.lastFrequency,
-        language: this.config.session.languageHint,
-      });
+      // Push discovered callsigns back to processor for context
+      if (result.features.callsignCandidates.length > 0) {
+        this.processor.updateContext({
+          knownCallsigns: result.features.callsignCandidates.map(c => c.value),
+        });
+      }
 
       const processedTurn: ProcessedTurn = {
         ...turn,
-        text: asrResult.text,
-        asrConfidence: asrResult.confidence,
-        asrProvider: asrResult.provider,
-        features,
+        text: result.text,
+        asrConfidence: result.confidence,
+        asrProvider: result.provider,
+        features: result.features,
         speaker: turn.direction === 'tx' ? this.config.session.myCallsign : undefined,
         speakerConfidence: turn.direction === 'tx' ? 1.0 : undefined,
       };
 
-      // Session engine handles routing to the correct candidate
       this.sessionEngine.processTurn(processedTurn);
       this.emit('turn:transcribed', processedTurn);
       this.updatePrimaryDraft();
@@ -180,6 +266,8 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
       this.emit('error', err instanceof Error ? err : new Error(String(err)));
     }
   }
+
+  // ─── Draft management ─────────────────────────────────────────
 
   private handleSessionStarted(candidateId: string): void {
     const candidate = this.sessionEngine.getPrimaryCandidate();
@@ -209,12 +297,13 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
 
     this.candidateDraftMap.delete(candidateId);
 
-    // Only reset engine if no other active candidates remain.
-    // Otherwise, other candidates continue to be tracked.
     const activeCandidates = this.sessionEngine.getCandidates()
       .filter(c => c.status === 'candidate' || c.status === 'active');
     if (activeCandidates.length === 0) {
       this.sessionEngine.reset();
+      // Do NOT reset processor here — conversation context should persist
+      // across QSO boundaries on the same frequency. Processor is only
+      // reset on frequency change (in pushMetadata) or dispose().
     }
   }
 
@@ -228,7 +317,6 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     const draftId = this.candidateDraftMap.get(candidateId);
     if (!draftId) return null;
 
-    // Look up the specific candidate by ID, not just primary
     const candidate = this.sessionEngine.getCandidate(candidateId);
     if (!candidate) return null;
 

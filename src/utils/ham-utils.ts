@@ -16,18 +16,25 @@ export function isValidCallsign(callsign: string): boolean {
 }
 
 /**
- * Core callsign regex pattern.
- * Prefix: 1-3 alphanumeric characters (at least one letter)
- * Digit: exactly one digit
- * Suffix: 1-4 letters
+ * Core callsign regex pattern based on ITU Radio Regulations.
+ *
+ * Prefix forms (per ITU Section III, Article 19):
+ *   - Single letter:     [BFGKIMNRW]       (e.g., K1ABC, W2XY)
+ *   - Digit + letter:    [0-9][A-Z]          (e.g., 9A1A, 3D2AG)
+ *   - Letter + digit:    [A-Z][0-9]          (e.g., E71A)
+ *   - Two letters:       [A-Z][A-Z]          (e.g., BH8NE, VK3DEF)
+ * Separator: exactly one digit [0-9]
+ * Suffix: 1-4 characters, last must be a letter
+ *
+ * Ref: https://regex101.com/library/gS6qG8
+ *      https://en.wikipedia.org/wiki/Amateur_radio_call_signs
  */
-export const CALLSIGN_REGEX = /^[A-Z0-9]{1,3}[0-9][A-Z]{1,4}$/;
+export const CALLSIGN_REGEX = /^(?:[BFGKIMNRW]|[0-9][A-Z]|[A-Z][0-9]|[A-Z]{2})[0-9][A-Z]{1,4}$/;
 
 /**
  * Regex for finding callsigns in text (non-anchored).
- * Uses word boundaries to avoid matching within other words.
  */
-export const CALLSIGN_IN_TEXT_REGEX = /\b([A-Z0-9]{1,3}[0-9][A-Z]{1,4})\b/g;
+export const CALLSIGN_IN_TEXT_REGEX = /\b((?:[BFGKIMNRW]|[0-9][A-Z]|[A-Z][0-9]|[A-Z]{2})[0-9][A-Z]{1,4})\b/g;
 
 /**
  * Normalize a callsign to uppercase, trimmed.

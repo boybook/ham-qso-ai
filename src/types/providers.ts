@@ -96,3 +96,86 @@ export interface LLMResult {
   /** Provider name */
   provider: string;
 }
+
+// ─── Unified Turn Processor ───────────────────────────────────────
+
+/**
+ * Unified turn processor interface.
+ *
+ * Replaces the serial ASR → FeatureExtractor chain with a single abstraction.
+ * Three implementation strategies:
+ *
+ * 1. **OmniConversationProcessor**: Maintains a persistent multi-turn conversation
+ *    with a multimodal LLM (e.g., qwen3-omni-flash). Each audio turn is a new
+ *    message; the LLM naturally retains context from all previous turns.
+ *
+ * 2. **ChainedTurnProcessor**: Wraps existing IASRProvider + IFeatureExtractor.
+ *    Backward-compatible with the original two-step pipeline.
+ *
+ * 3. **LocalTurnProcessor**: Local ASR + rule-based extraction. No network needed.
+ *
+ * The processor internally manages all context (conversation history, known
+ * callsigns, metadata). The pipeline only needs to call processTurn() and
+ * push context updates.
+ */
+export interface ITurnProcessor {
+  /** Provider/implementation name */
+  readonly name: string;
+
+  /** Initialize resources (API clients, models, etc.) */
+  initialize(): Promise<void>;
+
+  /**
+   * Process the next audio turn.
+   * Context is managed internally — just pass the audio.
+   */
+  processTurn(
+    audio: Float32Array,
+    sampleRate: number,
+  ): Promise<TurnProcessorResult>;
+
+  /**
+   * Push context updates into the processor.
+   * Called by the pipeline when metadata changes or new callsigns are discovered.
+   */
+  updateContext(update: ContextUpdate): void;
+
+  /**
+   * Reset conversation/context state.
+   * Called when a QSO session ends to start fresh.
+   */
+  reset(): void;
+
+  /** Release resources */
+  dispose(): Promise<void>;
+}
+
+/**
+ * Result from processing a turn.
+ */
+export interface TurnProcessorResult {
+  /** Transcribed text */
+  text: string;
+  /** Confidence estimate 0-1 */
+  confidence: number;
+  /** Extracted features (callsigns, RST, QTH, signals, etc.) */
+  features: import('./turn.js').TurnFeatures;
+  /** Provider/processor name */
+  provider: string;
+}
+
+/**
+ * Context update pushed to the processor.
+ */
+export interface ContextUpdate {
+  /** Current frequency in Hz */
+  frequency?: number;
+  /** Current mode (USB/LSB/FM/CW) */
+  mode?: string;
+  /** Callsigns discovered so far in this session */
+  knownCallsigns?: string[];
+  /** Operator's own callsign */
+  myCallsign?: string;
+  /** Language hint */
+  language?: string;
+}

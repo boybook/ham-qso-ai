@@ -30,8 +30,14 @@ export interface QSODraft {
  * All fields of a QSO log entry.
  */
 export interface QSOFields {
-  /** Their callsign */
+  /** Their callsign (highest confidence) */
   theirCallsign: ResolvedField<string>;
+  /**
+   * All station callsigns detected in this QSO, sorted by confidence.
+   * In monitor/SWL mode (myCallsign = LISTENER), this contains BOTH
+   * participants of the monitored QSO.
+   */
+  stationCallsigns?: ResolvedField<string>[];
   /** RST sent */
   rstSent: ResolvedField<string>;
   /** RST received */
