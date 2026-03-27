@@ -110,17 +110,26 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
 
     // Wire late-arriving LLM features (for ChainedConversationProcessor)
     if (this.processor instanceof ChainedConversationProcessor) {
-      this.processor.onLateFeatures = (_text, features) => {
+      const chainedProc = this.processor;
+      chainedProc.onLateFeatures = (_text, features) => {
         // Feed into station registry + session engine
         this.stationRegistry.feedLateFeatures(features);
         if (features.callsignCandidates.length > 0) {
-          this.processor.updateContext({
+          chainedProc.updateContext({
             knownCallsigns: features.callsignCandidates.map(c => c.value),
           });
           this.sessionEngine.processLateFeatures(features);
         }
         this.updatePrimaryDraft();
         this.syncStationsToActiveDrafts();
+        // Refresh anchor zone with latest station knowledge
+        chainedProc.updateStationSummary(
+          this.stationRegistry.getAll().map(s => ({
+            callsign: s.callsign,
+            qth: s.resolveQTH()?.value,
+            name: s.resolveName()?.value,
+          })),
+        );
       };
     }
 
@@ -324,6 +333,11 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
     this.candidateDraftMap.set(candidateId, draft.id);
     this.emit('qso:draft', draft);
     this.logger.info('new QSO draft created', { draftId: draft.id, candidateId });
+
+    // Notify processor: new QSO started → clear Active Zone
+    if (this.processor instanceof ChainedConversationProcessor) {
+      this.processor.onQSOStart(candidateId);
+    }
   }
 
   private handleSessionClosed(candidateId: string): void {
@@ -337,6 +351,10 @@ export class QSOPipeline extends EventEmitter<QSOPipelineEvents> {
         draftId: draft.id, status: draft.status,
         callsign: draft.stations[0]?.callsign,
       });
+      // Notify processor: QSO closed → compress Active Zone into History Zone
+      if (this.processor instanceof ChainedConversationProcessor) {
+        this.processor.onQSOClose(draft);
+      }
     }
 
     this.candidateDraftMap.delete(candidateId);

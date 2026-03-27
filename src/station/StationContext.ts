@@ -26,12 +26,17 @@ export interface StationSnapshot {
  * This is the bottom-level entity in the Station-Centric model.
  * Multiple StationContexts are combined into QSO Drafts.
  */
+// Station-level fields (QTH, name, grid) are static during a QSO session,
+// so use a long decay half-life (10 min) to prevent early correct values from
+// being displaced by late noisy extractions.
+const STATION_FIELD_SCORING = { decayHalfLifeMs: 600_000 };
+
 export class StationContext {
   readonly callsign: string;
-  readonly qth = new CandidatePool<string>();
-  readonly name = new CandidatePool<string>();
-  readonly grid = new CandidatePool<string>();
-  readonly equipment = new CandidatePool<string>();
+  readonly qth = new CandidatePool<string>({ scoringConfig: STATION_FIELD_SCORING });
+  readonly name = new CandidatePool<string>({ scoringConfig: STATION_FIELD_SCORING });
+  readonly grid = new CandidatePool<string>({ scoringConfig: STATION_FIELD_SCORING });
+  readonly equipment = new CandidatePool<string>({ scoringConfig: STATION_FIELD_SCORING });
 
   private _firstSeenAt: number;
   private _lastSeenAt: number;

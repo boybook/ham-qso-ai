@@ -4,7 +4,7 @@ import { createLogger, type ILogger } from '../utils/logger.js';
 import { EMPTY_FEATURES, parseLLMResponse } from '../extraction/llm-response-parser.js';
 import { RuleBasedFeatureExtractor } from '../extraction/FeatureExtractor.js';
 import type { TurnFeatures, SignalHit } from '../types/turn.js';
-import type { FieldCandidate } from '../types/qso.js';
+import type { FieldCandidate, QSODraft } from '../types/qso.js';
 
 /** Minimal ASR interface */
 interface ASRTranscriber {
@@ -27,8 +27,10 @@ export interface ChainedConversationProcessorConfig {
   language?: string;
   /** Operator's callsign */
   myCallsign?: string;
-  /** Max conversation turns before trimming (default: 30) */
+  /** Max active turns in current QSO before trimming (default: 30) */
   maxConversationTurns?: number;
+  /** Max history QSO summaries to retain (default: 5) */
+  maxHistoryQSOs?: number;
   /** Logger */
   logger?: ILogger;
 }
@@ -53,6 +55,9 @@ ASR 常见错误模式：
 
 信号报告：五九(59)、五九加(59+)。术语：抄收、Over、73、七三、再见、QTH。
 
+loc 字段只提取明确的 QTH 自报位置，如"我在XX"、"QTH XX"、"这里是XX"、"我的地址是XX"。
+路过提到、对比举例、设备品牌、网络运营商等不算 QTH，不要提取。
+
 JSON（只含实际出现的字段）：
 {"cs":[{"v":"呼号","c":0.9}],"rst":[{"v":"59","c":0.8}],"loc":[{"v":"地名"}],"close":false,"cont":false,"start":false}
 
@@ -73,21 +78,53 @@ JSON (only include fields actually found):
 
 Reference previous turns for context. Only extract from the CURRENT text.`;
 
+// ─── Three-Zone Context Types ────────────────────────────────────
+
+/** Compressed summary of a closed QSO (stored in History Zone) */
+interface QSOSummaryRecord {
+  /** Participating stations, e.g. "BG7ABS↔BH8YFG" */
+  stations: string;
+  /** Directional RST, e.g. "59/57" */
+  rst: string;
+  /** QTH notes, comma-joined */
+  notes: string;
+  /** Timestamp when QSO closed (for "N min ago" formatting) */
+  closedAt: number;
+  /** Internal draft ID, not sent to LLM */
+  qsoId: string;
+}
+
+/**
+ * Three-zone LLM context:
+ *
+ * Anchor Zone  — known station summaries (from StationRegistry, dynamic)
+ * History Zone — compressed summaries of closed QSOs (FIFO, bounded)
+ * Active Zone  — full turns of the current QSO (bounded by maxActiveTurns)
+ *
+ * buildMessages() assembles these into a flat messages[] for the LLM API.
+ */
+interface ThreeZoneContext {
+  anchorStations: Array<{ callsign: string; qth?: string; name?: string }>;
+  historyZone: QSOSummaryRecord[];
+  activeZone: Array<{ role: string; content: string }>;
+  currentQsoId: string | null;
+}
+
 /**
  * Chained Conversation Processor:
- * ASR (qwen3-asr-flash) → Multi-turn LLM conversation (qwen3-omni-flash)
+ * ASR (qwen3-asr-flash) → Multi-turn LLM conversation (qwen3.5-flash)
  *
  * Best of both worlds:
  * - ASR: dedicated model with best Chinese transcription quality
  * - LLM: persistent multi-turn conversation maintains context across turns
  *
- * The LLM conversation accumulates turn-by-turn:
- *   System: 你是分析系统...
- *   User: "CQ CQ CQ 这里是七区电台 Bravo Golf 7 Alpha Bravo Sierra"
- *   Assistant: {"cs":[{"v":"BG7ABS","c":0.9}],"start":true}
- *   User: "抄收 五九 贵州凯里 Over"
- *   Assistant: {"rst":[{"v":"59","c":0.9}],"loc":[{"v":"贵州凯里"}],"cont":true}
- *   ...LLM naturally has full context from previous analysis
+ * Uses a Three-Zone context model to bound token usage:
+ *   [System Prompt] [Anchor: known stations] [History: past QSO summaries] [Active: current QSO turns]
+ *
+ * QSO lifecycle integration (called by QSOPipeline):
+ *   onQSOStart(id)   — clears Active Zone for new QSO
+ *   onQSOClose(draft)— compresses Active Zone into History Zone
+ *   updateStationSummary(stations) — refreshes Anchor Zone
  */
 export class ChainedConversationProcessor implements ITurnProcessor {
   readonly name = 'chained-conversation';
@@ -95,22 +132,25 @@ export class ChainedConversationProcessor implements ITurnProcessor {
   private readonly asr: ASRTranscriber;
   private readonly ruleExtractor: RuleBasedFeatureExtractor;
   private readonly logger: ILogger;
-  private readonly maxTurns: number;
+  private readonly maxActiveTurns: number;
+  private readonly maxHistoryQSOs: number;
   private client: any = null;
 
-  // Persistent LLM conversation
-  private messages: Array<{ role: string; content: string }> = [];
+  // Three-zone LLM context
+  private threeZone: ThreeZoneContext;
+  private radioContext: { myCallsign?: string; frequency?: number; mode?: string; knownCallsigns?: string[] } = {};
   private language: string;
-  private context: { myCallsign?: string; frequency?: number; mode?: string; knownCallsigns?: string[] } = {};
 
   constructor(config: ChainedConversationProcessorConfig) {
     this.config = config;
     this.asr = config.asr;
     this.ruleExtractor = new RuleBasedFeatureExtractor();
     this.language = config.language ?? 'zh';
-    this.maxTurns = config.maxConversationTurns ?? 30;
+    this.maxActiveTurns = config.maxConversationTurns ?? 30;
+    this.maxHistoryQSOs = config.maxHistoryQSOs ?? 5;
     this.logger = createLogger('ChainedConversation', config.logger);
-    if (config.myCallsign) this.context.myCallsign = config.myCallsign;
+    if (config.myCallsign) this.radioContext.myCallsign = config.myCallsign;
+    this.threeZone = this.createEmptyContext();
   }
 
   async initialize(): Promise<void> {
@@ -122,10 +162,11 @@ export class ChainedConversationProcessor implements ITurnProcessor {
       baseURL: this.config.llmBaseURL ?? 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     });
 
-    this.resetConversation();
     this.logger.info('initialized', {
       asr: this.asr.name ?? 'asr',
       llm: this.config.llmModel ?? 'qwen3-omni-flash',
+      maxActiveTurns: this.maxActiveTurns,
+      maxHistoryQSOs: this.maxHistoryQSOs,
     });
   }
 
@@ -178,26 +219,152 @@ export class ChainedConversationProcessor implements ITurnProcessor {
   }
 
   updateContext(update: ContextUpdate): void {
-    if (update.frequency !== undefined) this.context.frequency = update.frequency;
-    if (update.mode !== undefined) this.context.mode = update.mode;
-    if (update.myCallsign !== undefined) this.context.myCallsign = update.myCallsign;
+    if (update.frequency !== undefined) this.radioContext.frequency = update.frequency;
+    if (update.mode !== undefined) this.radioContext.mode = update.mode;
+    if (update.myCallsign !== undefined) this.radioContext.myCallsign = update.myCallsign;
     if (update.knownCallsigns) {
-      const existing = new Set(this.context.knownCallsigns ?? []);
+      const existing = new Set(this.radioContext.knownCallsigns ?? []);
       for (const cs of update.knownCallsigns) existing.add(cs);
-      this.context.knownCallsigns = [...existing];
+      this.radioContext.knownCallsigns = [...existing];
     }
   }
 
+  /**
+   * Called when a new QSO session starts (by QSOPipeline.handleSessionStarted).
+   * Clears the Active Zone to start fresh for the new QSO.
+   */
+  onQSOStart(qsoId: string): void {
+    this.threeZone.activeZone = [];
+    this.threeZone.currentQsoId = qsoId;
+    this.logger.debug('QSO started, active zone cleared', { qsoId });
+  }
+
+  /**
+   * Called when a QSO session closes (by QSOPipeline.handleSessionClosed).
+   * Compresses the Active Zone into a QSO summary and appends to History Zone.
+   */
+  onQSOClose(draft: QSODraft): void {
+    if (this.threeZone.activeZone.length === 0) return;
+
+    const summary = this.buildQSOSummary(draft);
+    this.threeZone.historyZone.push(summary);
+    if (this.threeZone.historyZone.length > this.maxHistoryQSOs) {
+      this.threeZone.historyZone.shift();
+    }
+    this.threeZone.activeZone = [];
+    this.threeZone.currentQsoId = null;
+    this.logger.debug('QSO closed, history zone updated', {
+      historyCount: this.threeZone.historyZone.length,
+      summary: summary.stations,
+    });
+  }
+
+  /**
+   * Refresh the Anchor Zone with current known stations (from StationRegistry).
+   * Called by QSOPipeline after onLateFeatures arrives.
+   */
+  updateStationSummary(stations: Array<{ callsign: string; qth?: string; name?: string }>): void {
+    this.threeZone.anchorStations = stations
+      .filter(s => s.callsign)
+      .slice(0, 10); // cap at 10 stations to bound anchor zone size
+  }
+
+  /**
+   * Full reset: clears Active Zone + History Zone on frequency change.
+   * Anchor Zone (station knowledge) is preserved — it's frequency-independent.
+   */
   reset(): void {
-    this.resetConversation();
-    this.context.knownCallsigns = [];
-    this.logger.info('conversation reset');
+    this.threeZone.activeZone = [];
+    this.threeZone.historyZone = [];
+    this.threeZone.currentQsoId = null;
+    this.radioContext.knownCallsigns = [];
+    this.logger.info('context reset (frequency change)');
   }
 
   async dispose(): Promise<void> {
     await this.asr.dispose();
-    this.messages = [];
+    this.threeZone = this.createEmptyContext();
     this.client = null;
+  }
+
+  // ─── Three-Zone Context ───────────────────────────────────────
+
+  private createEmptyContext(): ThreeZoneContext {
+    return {
+      anchorStations: [],
+      historyZone: [],
+      activeZone: [],
+      currentQsoId: null,
+    };
+  }
+
+  /**
+   * Assemble all three zones into a flat messages[] array for the LLM API.
+   *
+   * Structure:
+   *   [system]
+   *   [user: anchor zone]  [assistant: 已记录]   -- if any known stations
+   *   [user: history zone] [assistant: 已记录]   -- if any past QSOs
+   *   ...active zone user/assistant pairs...
+   */
+  private buildMessages(): Array<{ role: string; content: string }> {
+    const prompt = this.language === 'zh' ? SYSTEM_PROMPT_ZH : SYSTEM_PROMPT_EN;
+    const result: Array<{ role: string; content: string }> = [
+      { role: 'system', content: prompt },
+    ];
+
+    // Anchor zone: known stations summary
+    if (this.threeZone.anchorStations.length > 0) {
+      const stationText = this.threeZone.anchorStations
+        .map(s => {
+          const parts = [s.callsign];
+          if (s.qth) parts.push(s.qth);
+          if (s.name) parts.push(s.name);
+          return parts.join(':');
+        })
+        .join(' | ');
+      result.push({ role: 'user', content: `[已知电台]\n${stationText}` });
+      result.push({ role: 'assistant', content: '已记录' });
+    }
+
+    // History zone: past QSO summaries
+    if (this.threeZone.historyZone.length > 0) {
+      const historyText = this.threeZone.historyZone.map((record, i) => {
+        const minAgo = Math.round((Date.now() - record.closedAt) / 60000);
+        const timeStr = minAgo < 1 ? '刚刚' : `${minAgo}min前`;
+        const parts = [`${i + 1}. ${record.stations}`];
+        if (record.rst) parts.push(`RST:${record.rst}`);
+        if (record.notes) parts.push(record.notes);
+        parts.push(`[${timeStr}]`);
+        return parts.join(' ');
+      }).join('\n');
+      result.push({ role: 'user', content: `[历史通联]\n${historyText}` });
+      result.push({ role: 'assistant', content: '已记录' });
+    }
+
+    // Active zone: current QSO turns
+    result.push(...this.threeZone.activeZone);
+
+    return result;
+  }
+
+  /** Build a compact summary record from a closed QSODraft */
+  private buildQSOSummary(draft: QSODraft): QSOSummaryRecord {
+    const stations = draft.stations.map(s => s.callsign).join('↔') || '?';
+
+    const rstA = draft.rstAtoB?.value;
+    const rstB = draft.rstBtoA?.value;
+    let rst = '';
+    if (rstA && rstB) rst = `${rstA}/${rstB}`;
+    else if (rstA) rst = rstA;
+    else if (rstB) rst = rstB;
+
+    const notes = draft.stations
+      .map(s => s.qth)
+      .filter((q): q is string => Boolean(q))
+      .join(',');
+
+    return { stations, rst, notes, closedAt: Date.now(), qsoId: draft.id };
   }
 
   // ─── LLM Conversation ────────────────────────────────────────
@@ -205,26 +372,30 @@ export class ChainedConversationProcessor implements ITurnProcessor {
   private async extractWithConversation(asrText: string): Promise<TurnFeatures> {
     if (!this.client) return { ...EMPTY_FEATURES };
 
-    // Build user message: just the ASR text + optional context hints
+    // Build user message: ASR text + optional context hints
     let userContent = asrText;
     const hints: string[] = [];
-    if (this.context.knownCallsigns?.length) {
-      hints.push(`[已知电台: ${this.context.knownCallsigns.join(', ')}]`);
+    if (this.radioContext.knownCallsigns?.length) {
+      hints.push(`[已知电台: ${this.radioContext.knownCallsigns.join(', ')}]`);
     }
-    if (this.context.frequency) {
-      hints.push(`[${(this.context.frequency / 1e6).toFixed(3)} MHz ${this.context.mode ?? ''}]`);
+    if (this.radioContext.frequency) {
+      hints.push(`[${(this.radioContext.frequency / 1e6).toFixed(3)} MHz ${this.radioContext.mode ?? ''}]`);
     }
     if (hints.length > 0) {
       userContent = hints.join(' ') + '\n' + asrText;
     }
 
-    this.messages.push({ role: 'user', content: userContent });
+    // Append to Active Zone
+    this.threeZone.activeZone.push({ role: 'user', content: userContent });
+
+    // Assemble full messages from three zones
+    const messages = this.buildMessages();
 
     try {
       const model = this.config.llmModel ?? 'qwen3-omni-flash';
       const response = await this.client.chat.completions.create({
         model,
-        messages: this.messages,
+        messages,
         temperature: 0,
         max_tokens: 400,
         response_format: { type: 'json_object' },
@@ -242,17 +413,17 @@ export class ChainedConversationProcessor implements ITurnProcessor {
         });
       }
 
-      // Add assistant response to maintain conversation
-      this.messages.push({ role: 'assistant', content: responseText });
-      this.trimMessages();
+      // Add assistant response to Active Zone
+      this.threeZone.activeZone.push({ role: 'assistant', content: responseText });
+      this.trimActiveZone();
 
       if (!responseText.trim()) return { ...EMPTY_FEATURES };
 
       this.logger.debug('LLM response', responseText);
       return parseLLMResponse(responseText, undefined, this.logger);
     } catch (err) {
-      // Remove failed user message
-      this.messages.pop();
+      // Remove failed user message from Active Zone
+      this.threeZone.activeZone.pop();
       this.logger.warn('LLM extraction failed', {
         error: err instanceof Error ? err.message : String(err),
       });
@@ -260,18 +431,12 @@ export class ChainedConversationProcessor implements ITurnProcessor {
     }
   }
 
-  private resetConversation(): void {
-    const prompt = this.language === 'zh' ? SYSTEM_PROMPT_ZH : SYSTEM_PROMPT_EN;
-    this.messages = [{ role: 'system', content: prompt }];
-  }
-
-  private trimMessages(): void {
-    const maxMessages = 1 + this.maxTurns * 2;
-    if (this.messages.length > maxMessages) {
-      const system = this.messages[0];
-      const recent = this.messages.slice(-(maxMessages - 1));
-      this.messages = [system, ...recent];
-      this.logger.debug('conversation trimmed', { messageCount: this.messages.length });
+  /** Trim Active Zone to maxActiveTurns * 2 messages (keep most recent) */
+  private trimActiveZone(): void {
+    const maxMessages = this.maxActiveTurns * 2;
+    if (this.threeZone.activeZone.length > maxMessages) {
+      this.threeZone.activeZone = this.threeZone.activeZone.slice(-maxMessages);
+      this.logger.debug('active zone trimmed', { messageCount: this.threeZone.activeZone.length });
     }
   }
 

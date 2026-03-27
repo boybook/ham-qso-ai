@@ -4,13 +4,12 @@
  * Usage:
  *   OPENAI_API_KEY=sk-... npx tsx demo/run.ts
  *
- * Expects demo/demo.wav in the same directory.
- * (demo.opus is the compressed version in the repo; convert with:
- *  ffmpeg -i demo/demo.opus demo/demo.wav)
+ * Requires ffmpeg to be installed (used to decode demo.opus).
  */
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { spawnSync } from 'child_process';
 
 // Load .env file
 const __dirname2 = path.dirname(fileURLToPath(import.meta.url));
@@ -41,57 +40,35 @@ if (!OPENAI_API_KEY && !DASHSCOPE_API_KEY) {
   process.exit(1);
 }
 
-const WAV_PATH = path.join(__dirname, 'demo.wav');
-if (!fs.existsSync(WAV_PATH)) {
-  console.error(`Error: ${WAV_PATH} not found`);
+const OPUS_PATH = path.join(__dirname, 'demo.opus');
+if (!fs.existsSync(OPUS_PATH)) {
+  console.error(`Error: ${OPUS_PATH} not found`);
   process.exit(1);
 }
 
-// ─── Read WAV ────────────────────────────────────────────────────
-function readWav(filePath: string): { samples: Float32Array; sampleRate: number } {
-  const buf = fs.readFileSync(filePath);
+// ─── Decode Opus via ffmpeg ───────────────────────────────────────
+function decodeOpus(filePath: string): { samples: Float32Array; sampleRate: number } {
+  const sampleRate = 16000;
+  const result = spawnSync('ffmpeg', [
+    '-i', filePath,
+    '-f', 'f32le',   // raw 32-bit float PCM
+    '-ar', String(sampleRate),
+    '-ac', '1',      // mono
+    'pipe:1',
+  ], { maxBuffer: 256 * 1024 * 1024 });
 
-  // Parse WAV header
-  const riff = buf.toString('ascii', 0, 4);
-  if (riff !== 'RIFF') throw new Error('Not a WAV file');
+  if (result.error) throw new Error(`ffmpeg not found: ${result.error.message}`);
+  if (result.status !== 0) throw new Error(`ffmpeg failed:\n${result.stderr?.toString()}`);
 
-  const channels = buf.readUInt16LE(22);
-  const sampleRate = buf.readUInt32LE(24);
-  const bitsPerSample = buf.readUInt16LE(34);
-
-  // Find data chunk
-  let dataOffset = 36;
-  while (dataOffset < buf.length - 8) {
-    const chunkId = buf.toString('ascii', dataOffset, dataOffset + 4);
-    const chunkSize = buf.readUInt32LE(dataOffset + 4);
-    if (chunkId === 'data') {
-      dataOffset += 8;
-      break;
-    }
-    dataOffset += 8 + chunkSize;
-  }
-
-  // Read PCM data
-  const bytesPerSample = bitsPerSample / 8;
-  const numSamples = Math.floor((buf.length - dataOffset) / bytesPerSample);
-  const samples = new Float32Array(numSamples);
-
-  for (let i = 0; i < numSamples; i++) {
-    const offset = dataOffset + i * bytesPerSample;
-    if (bitsPerSample === 16) {
-      samples[i] = buf.readInt16LE(offset) / 32768;
-    } else if (bitsPerSample === 32) {
-      samples[i] = buf.readFloatLE(offset);
-    }
-  }
-
-  console.log(`Loaded WAV: ${sampleRate}Hz, ${channels}ch, ${bitsPerSample}bit, ${(numSamples / sampleRate).toFixed(1)}s`);
+  const buf = result.stdout as Buffer;
+  const samples = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+  console.log(`Decoded opus: ${sampleRate}Hz mono, ${(samples.length / sampleRate).toFixed(1)}s`);
   return { samples, sampleRate };
 }
 
 // ─── Main ────────────────────────────────────────────────────────
 async function main() {
-  const { samples, sampleRate } = readWav(WAV_PATH);
+  const { samples, sampleRate } = decodeOpus(OPUS_PATH);
 
   // Create pipeline with factory function — one line setup
   const useDashScope = !!DASHSCOPE_API_KEY;
@@ -228,24 +205,22 @@ function printDraft(draft: QSODraft, label: string) {
   const f = draft.fields;
   console.log(`\n--- ${label} Draft [${draft.status}] ---`);
 
-  // Station-centric view
   if (draft.stations.length > 0) {
     console.log('  Participants:');
     for (const p of draft.stations) {
       const parts = [`    ${p.callsign} (conf: ${p.confidence.toFixed(2)})`];
       if (p.qth) parts.push(`QTH: ${p.qth}`);
+      if (p.name) parts.push(`Name: ${p.name}`);
       if (p.equipment) parts.push(`Equipment: ${p.equipment}`);
       console.log(parts.join(' | '));
     }
   }
 
-  // Legacy fields
-  console.log(`  Their Callsign: ${f.theirCallsign.value || '?'} (conf: ${f.theirCallsign.confidence.toFixed(2)})`);
-  console.log(`  RST Sent:       ${f.rstSent.value} (conf: ${f.rstSent.confidence.toFixed(2)})`);
-  console.log(`  RST Received:   ${f.rstReceived.value} (conf: ${f.rstReceived.confidence.toFixed(2)})`);
-  console.log(`  Frequency:      ${f.frequency.value ? (f.frequency.value / 1000000).toFixed(3) + ' MHz' : '?'}`);
-  console.log(`  Mode:           ${f.mode.value || '?'}`);
-  console.log(`  Turns:          ${draft.turns.length}`);
+  const rstAB = draft.rstAtoB?.value || '?';
+  const rstBA = draft.rstBtoA?.value || '?';
+  console.log(`  RST A→B: ${rstAB}  RST B→A: ${rstBA}`);
+  console.log(`  Frequency: ${f.frequency.value ? (f.frequency.value / 1000000).toFixed(3) + ' MHz' : '?'}  Mode: ${f.mode.value || '?'}`);
+  console.log(`  Turns: ${draft.turns.length}`);
 }
 
 main().catch(err => {

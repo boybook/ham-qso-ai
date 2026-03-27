@@ -116,9 +116,18 @@ export class StationRegistry {
       station.recordMention(c.confidence);
       callsigns.push(station.callsign);
     }
-    // QTH from late features — assign to first callsign if present
+    // QTH from late features — try to pair QTH values with callsigns.
+    // When the LLM extracts N callsigns and N QTH values, pair them index-wise
+    // (LLM tends to list them in the same spoken order). When counts differ,
+    // fall back to assigning all QTH to the first callsign.
     if (callsigns.length > 0 && features.qthCandidates.length > 0) {
-      this.stations.get(callsigns[0])?.feedQTH(features.qthCandidates);
+      if (features.qthCandidates.length === callsigns.length) {
+        features.qthCandidates.forEach((qth, i) => {
+          this.stations.get(callsigns[i])?.feedQTH([qth]);
+        });
+      } else {
+        this.stations.get(callsigns[0])?.feedQTH(features.qthCandidates);
+      }
     }
     return callsigns;
   }
